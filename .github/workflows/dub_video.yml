@@ -1,0 +1,46 @@
+name: Video Dubbing Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'Video URL (Facebook / YouTube)'
+        required: true
+        type: string
+      target_language:
+        description: 'Target Language Code (e.g., hi, es, fr)'
+        required: true
+        default: 'hi'
+      video_speed:
+        description: 'Video Speed Factor (e.g., 1.0, 1.25)'
+        required: true
+        default: '1.0'
+
+jobs:
+  dub:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 🎬 Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: 📦 Install Python Packages
+        run: pip install -r requirements.txt
+
+      - name: 🚀 Run Dubbing Script
+        run: |
+          python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}" "${{ inputs.video_speed }}"
+
+      - name: 📤 Upload Dubbed Video
+        uses: actions/upload-artifact@v4
+        with:
+          name: dubbed-video
+          path: final_output.mp4
