@@ -15,7 +15,6 @@ android {
         versionName = "1.0"
     }
 
-    // Explicitly set JVM target to 17 to fix the compiler mismatch
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -40,4 +39,9 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
+
+    // 🌐 Network client for GitHub API and video download
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // 🗜️ Coroutines for background tasks
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
 }
