@@ -48,7 +48,7 @@ def get_duration(file_path: str) -> float:
 # ==========================================
 def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[dict]:
     print("🎙️ Transcribing audio with faster-whisper...")
-    model = WhisperModel("small", device="cpu", compute_type="int8")
+    model = WhisperModel("tiny", device="cpu", compute_type="int8") # 🪶 Changed from 'small' to 'tiny'
     raw_segments, _ = model.transcribe(audio_path, language="en", vad_filter=True)
 
     translator = GoogleTranslator(source='en', target=target_lang)
