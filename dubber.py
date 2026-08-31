@@ -173,7 +173,7 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
     with open(script_path, "w") as f:
         f.write("\n".join(filter_lines))
 
-    # Run FFmpeg compilation with compression controls (-crf 23)
+    # Run FFmpeg compilation with strict video bitrate capping
     print("✨ Mixing audio and encoding compressed MP4...")
     cmd = ['ffmpeg', '-y', '-i', video_path]
     for seg in segments:
@@ -185,14 +185,15 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
         '-map', '[aout]',
         '-map_metadata', '-1',
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', '23',          # 🗜️ Keeps file size controlled to prevent runner crashes
+        '-preset', 'veryfast',
+        '-b:v', '2500k',       # 🗜️ Forces video bitrate to ~2.5 Mbps (prevents massive file explosion)
+        '-maxrate', '3000k',
+        '-bufsize', '6000k',
         '-c:a', 'aac',
         '-b:a', '192k',
         output_file
     ])
     subprocess.run(cmd, check=True)
-
 # ==========================================
 # 5. 📝 Subtitle (.srt) Generation
 # ==========================================
