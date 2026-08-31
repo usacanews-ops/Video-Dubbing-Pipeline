@@ -7,7 +7,6 @@ import yt_dlp
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
 import edge_tts
-from pydub import AudioSegment
 
 # ==========================================
 # 1. 📥 Download Video & Extract Audio
@@ -45,57 +44,35 @@ def get_duration(file_path: str) -> float:
     return float(subprocess.check_output(cmd, shell=True).strip())
 
 # ==========================================
-# 2. 🎙️ Transcription & Smart Chunking
+# 2. 🎙️ Transcription & Resilient Translation
 # ==========================================
 def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[dict]:
-    print("🎙️ Transcribing audio with faster-whisper...")
+    print("🎙️ Transcribing audio with faster-whisper (tiny)...")
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
     raw_segments, _ = model.transcribe(audio_path, language="en", vad_filter=True)
 
     translator = GoogleTranslator(source='en', target=target_lang)
-    raw_list = []
+    segments = []
 
+    print(f"🌐 Translating segments into '{target_lang}'...")
     for s in raw_segments:
         text = s.text.strip()
-        if text:
-            raw_list.append({"start": s.start, "end": s.end, "text": text})
+        if not text:
+            continue
 
-    # 🧠 Group micro-segments into clean 5-8 second blocks to prevent FFmpeg crashes
-    print(f"🧩 Grouping {len(raw_list)} raw fragments into smooth dialogue blocks...")
-    grouped_segments = []
-    if not raw_list:
-        return []
-
-    current_block = {"start": raw_list[0]["start"], "end": raw_list[0]["end"], "texts": [raw_list[0]["text"]]}
-
-    for s in raw_list[1:]:
-        # If gap is small and block duration is under 7 seconds, merge them
-        if (s["start"] - current_block["end"] < 1.5) and (s["end"] - current_block["start"] < 7.0):
-            current_block["end"] = s["end"]
-            current_block["texts"].append(s["text"])
-        else:
-            grouped_segments.append(current_block)
-            current_block = {"start": s["start"], "end": s["end"], "texts": [s["text"]]}
-    grouped_segments.append(current_block)
-
-    # Translate each block
-    segments = []
-    print(f"🌐 Translating {len(grouped_segments)} blocks into '{target_lang}'...")
-    for block in grouped_segments:
-        combined_text = " ".join(block["texts"])
-        translated = combined_text
-        for _ in range(3):
+        translated = text
+        for attempt in range(3):
             try:
-                res = translator.translate(combined_text)
-                if res:
-                    translated = res
+                result = translator.translate(text)
+                if result:
+                    translated = result
                     break
             except Exception:
                 time.sleep(2)
 
         segments.append({
-            "start": block["start"],
-            "end": block["end"],
+            "start": s.start,
+            "end": s.end,
             "translated_text": translated
         })
 
@@ -114,99 +91,42 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
 
         communicate = edge_tts.Communicate(seg["translated_text"], "hi-IN-MadhurNeural")
         await communicate.save(audio_file)
-
         seg["tts_dur"] = get_duration(audio_file)
 
 # ==========================================
-# 4. 🎬 Dynamic Video Stretching & Audio Mixing
+# 4. 🎬 Lightweight Stable Video Assembly
 # ==========================================
-def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: str):
-    print("🎬 Calculating lightweight timeline & pre-mixing audio...")
-    total_video_dur = get_duration(video_path)
+def assemble_video(video_path: str, segments: list[dict], output_file: str):
+    print("🎬 Assembling final video timeline safely...")
     
-    filter_lines = []
-    video_concat_inputs = []
-    part_idx = 0
-    current_new_time = 0.0
-    last_orig_end = 0.0
+    filter_inputs = []
+    filter_complex = ""
 
     for i, seg in enumerate(segments):
-        start = seg['start']
-        end = seg['end']
-        tts_dur = seg['tts_dur']
-        orig_dur = end - start
+        filter_inputs.extend(['-i', seg['audio_file']])
+        start_ms = int(seg['start'] * 1000)
+        # Delay each TTS audio clip to match its original subtitle start timestamp
+        filter_complex += f"[{i+1}:a]adelay={start_ms}|{start_ms}[a{i}];"
 
-        # 1. Keep gap before segment at normal speed
-        if start > last_orig_end:
-            gap_dur = start - last_orig_end
-            filter_lines.append(f"[0:v]trim=start={last_orig_end}:end={start},setpts=PTS-STARTPTS,fps=30[vpart{part_idx}];")
-            video_concat_inputs.append(f"[vpart{part_idx}]")
-            part_idx += 1
-            current_new_time += gap_dur
+    audio_labels = "".join([f"[a{i}]" for i in range(len(segments))])
+    # Mix all audio tracks together cleanly without cutting the video stream into pieces
+    filter_complex += f"{audio_labels}amix=inputs={len(segments)}:normalize=0[aout]"
 
-        # 2. Process Dialogue Segment
-        factor = 1.0
-        if tts_dur > orig_dur:
-            factor = tts_dur / orig_dur
-            actual_seg_dur = tts_dur
-        else:
-            actual_seg_dur = orig_dur
-
-        filter_lines.append(f"[0:v]trim=start={start}:end={end},setpts={factor}*(PTS-STARTPTS),fps=30[vpart{part_idx}];")
-        video_concat_inputs.append(f"[vpart{part_idx}]")
-        part_idx += 1
-
-        seg['new_start'] = current_new_time
-        seg['new_end'] = current_new_time + tts_dur
-
-        current_new_time += actual_seg_dur
-        last_orig_end = end
-
-    # Add remaining video at the end
-    if last_orig_end < total_video_dur:
-        filter_lines.append(f"[0:v]trim=start={last_orig_end}:end={total_video_dur},setpts=PTS-STARTPTS,fps=30[vpart{part_idx}];")
-        video_concat_inputs.append(f"[vpart{part_idx}]")
-        part_idx += 1
-
-    concat_v = "".join(video_concat_inputs)
-    filter_lines.append(f"{concat_v}concat=n={part_idx}:v=1:a=0[vout];")
-
-    script_path = "filter_script.txt"
-    with open(script_path, "w") as f:
-        f.write("\n".join(filter_lines))
-
-    # Pre-mix master audio track using Pydub
-    print("🎧 Compiling master audio track...")
-    total_audio_dur_ms = int((current_new_time + 2.0) * 1000)
-    master_audio = AudioSegment.silent(duration=total_audio_dur_ms)
-
-    for seg in segments:
-        seg_audio = AudioSegment.from_file(seg['audio_file'])
-        start_ms = int(seg['new_start'] * 1000)
-        master_audio = master_audio.overlay(seg_audio, position=start_ms)
-
-    master_audio_path = "master_output_audio.wav"
-    master_audio.export(master_audio_path, format="wav")
-
-    # Clean FFmpeg run
-    print("✨ Encoding final MP4...")
     cmd = [
         'ffmpeg', '-y',
         '-i', video_path,
-        '-i', master_audio_path,
-        '-filter_complex_script', script_path,
-        '-map', '[vout]',
-        '-map', '1:a',
+        *filter_inputs,
+        '-filter_complex', filter_complex,
+        '-map', '0:v',
+        '-map', '[aout]',
         '-map_metadata', '-1',
         '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-b:v', '2500k',
-        '-maxrate', '3000k',
-        '-bufsize', '6000k',
+        '-preset', 'ultrafast',
         '-c:a', 'aac',
-        '-b:a', '192k',
         output_file
     ]
+    
+    print("✨ Running lightweight FFmpeg compilation...")
     subprocess.run(cmd, check=True)
 
 # ==========================================
@@ -223,8 +143,8 @@ def generate_srt(segments: list[dict], output_file: str = "subtitles.srt"):
     print("📝 Generating synchronized SRT file...")
     with open(output_file, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, start=1):
-            start_str = format_timestamp(seg["new_start"])
-            end_str = format_timestamp(seg["new_end"])
+            start_str = format_timestamp(seg["start"])
+            end_str = format_timestamp(seg["end"])
             f.write(f"{i}\n{start_str} --> {end_str}\n{seg['translated_text']}\n\n")
 
 if __name__ == "__main__":
@@ -235,5 +155,5 @@ if __name__ == "__main__":
     segs = transcribe_and_translate(a_file, target_lang=target_lang)
     asyncio.run(synthesize_audio(segs))
     
-    build_ffmpeg_timeline(v_file, segs, "final_output.mp4")
+    assemble_video(v_file, segs, "final_output.mp4")
     generate_srt(segs, "subtitles.srt")
