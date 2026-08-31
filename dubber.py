@@ -48,7 +48,7 @@ def get_duration(file_path: str) -> float:
 # ==========================================
 def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[dict]:
     print("🎙️ Transcribing audio with faster-whisper...")
-    model = WhisperModel("tiny", device="cpu", compute_type="int8") # 🪶 Changed from 'small' to 'tiny'
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
     raw_segments, _ = model.transcribe(audio_path, language="en", vad_filter=True)
 
     translator = GoogleTranslator(source='en', target=target_lang)
@@ -96,7 +96,6 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
         audio_file = os.path.join(temp_dir, f"audio_{i}.mp3")
         seg["audio_file"] = audio_file
 
-        # No forced speed increase; let it speak naturally
         communicate = edge_tts.Communicate(seg["translated_text"], "hi-IN-MadhurNeural")
         await communicate.save(audio_file)
 
@@ -174,8 +173,8 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
     with open(script_path, "w") as f:
         f.write("\n".join(filter_lines))
 
-    # Run FFmpeg compilation with ultrafast encoding preset
-    print("✨ Mixing audio and encoding final MP4...")
+    # Run FFmpeg compilation with compression controls (-crf 23)
+    print("✨ Mixing audio and encoding compressed MP4...")
     cmd = ['ffmpeg', '-y', '-i', video_path]
     for seg in segments:
         cmd.extend(['-i', seg['audio_file']])
@@ -187,7 +186,9 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
         '-map_metadata', '-1',
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
+        '-crf', '23',          # 🗜️ Keeps file size controlled to prevent runner crashes
         '-c:a', 'aac',
+        '-b:a', '192k',
         output_file
     ])
     subprocess.run(cmd, check=True)
