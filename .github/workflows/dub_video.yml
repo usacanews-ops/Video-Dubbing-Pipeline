@@ -24,12 +24,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'  # ⚡ Saves time & resources by caching installed libraries
+          cache: 'pip'
+
+      - name: 🎬 Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: 📦 Update yt-dlp & Install Requirements
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade yt-dlp  # 🛠️ Fixes Facebook parsing errors instantly
+          pip install --upgrade yt-dlp
           pip install -r requirements.txt
 
       - name: 🚀 Run Dubbing Script
