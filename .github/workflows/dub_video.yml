@@ -11,10 +11,6 @@ on:
         description: 'Target Language Code (e.g., hi, es, fr)'
         required: true
         default: 'hi'
-      video_speed:
-        description: 'Video Speed Factor (e.g., 1.0, 1.25)'
-        required: true
-        default: '1.0'
 
 jobs:
   dub:
@@ -24,23 +20,26 @@ jobs:
       - name: 📥 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Setup Python
+      - name: 🐍 Setup Python & Cache Pip Dependencies
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
+          cache: 'pip'  # ⚡ Saves time & resources by caching installed libraries
 
-      - name: 🎬 Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: 📦 Install Python Packages
-        run: pip install -r requirements.txt
+      - name: 📦 Update yt-dlp & Install Requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade yt-dlp  # 🛠️ Fixes Facebook parsing errors instantly
+          pip install -r requirements.txt
 
       - name: 🚀 Run Dubbing Script
         run: |
-          python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}" "${{ inputs.video_speed }}"
+          python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}"
 
-      - name: 📤 Upload Dubbed Video
+      - name: 📤 Upload Dubbed Video and Subtitles
         uses: actions/upload-artifact@v4
         with:
-          name: dubbed-video
-          path: final_output.mp4
+          name: dubbed-video-package
+          path: |
+            final_output.mp4
+            subtitles.srt
