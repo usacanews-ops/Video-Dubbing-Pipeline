@@ -45,7 +45,7 @@ def get_duration(file_path: str) -> float:
     return float(subprocess.check_output(cmd, shell=True).strip())
 
 # ==========================================
-# 2. 🎙️ Transcription & Resilient Translation
+# 2. 🎙️ Transcription & Smart Chunking
 # ==========================================
 def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[dict]:
     print("🎙️ Transcribing audio with faster-whisper...")
@@ -53,45 +53,60 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     raw_segments, _ = model.transcribe(audio_path, language="en", vad_filter=True)
 
     translator = GoogleTranslator(source='en', target=target_lang)
-    segments = []
+    raw_list = []
 
-    print(f"🌐 Translating segments into '{target_lang}'...")
     for s in raw_segments:
         text = s.text.strip()
-        if not text:
-            continue
+        if text:
+            raw_list.append({"start": s.start, "end": s.end, "text": text})
 
-        translated = text
-        for attempt in range(3):
+    # 🧠 Group micro-segments into clean 5-8 second blocks to prevent FFmpeg crashes
+    print(f"🧩 Grouping {len(raw_list)} raw fragments into smooth dialogue blocks...")
+    grouped_segments = []
+    if not raw_list:
+        return []
+
+    current_block = {"start": raw_list[0]["start"], "end": raw_list[0]["end"], "texts": [raw_list[0]["text"]]}
+
+    for s in raw_list[1:]:
+        # If gap is small and block duration is under 7 seconds, merge them
+        if (s["start"] - current_block["end"] < 1.5) and (s["end"] - current_block["start"] < 7.0):
+            current_block["end"] = s["end"]
+            current_block["texts"].append(s["text"])
+        else:
+            grouped_segments.append(current_block)
+            current_block = {"start": s["start"], "end": s["end"], "texts": [s["text"]]}
+    grouped_segments.append(current_block)
+
+    # Translate each block
+    segments = []
+    print(f"🌐 Translating {len(grouped_segments)} blocks into '{target_lang}'...")
+    for block in grouped_segments:
+        combined_text = " ".join(block["texts"])
+        translated = combined_text
+        for _ in range(3):
             try:
-                result = translator.translate(text)
-                if result:
-                    translated = result
+                res = translator.translate(combined_text)
+                if res:
+                    translated = res
                     break
             except Exception:
                 time.sleep(2)
 
         segments.append({
-            "start": s.start,
-            "end": s.end,
+            "start": block["start"],
+            "end": block["end"],
             "translated_text": translated
         })
-
-    # Sanitize overlapping timestamps
-    for i in range(1, len(segments)):
-        if segments[i]['start'] < segments[i-1]['end']:
-            segments[i]['start'] = segments[i-1]['end']
-            if segments[i]['end'] <= segments[i]['start']:
-                segments[i]['end'] = segments[i]['start'] + 0.1
 
     return segments
 
 # ==========================================
-# 3. 🗣️ Speech Synthesis (Natural Speed)
+# 3. 🗣️ Speech Synthesis
 # ==========================================
 async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
     os.makedirs(temp_dir, exist_ok=True)
-    print("🗣️ Synthesizing normal-speed voiceovers...")
+    print("🗣️ Synthesizing voiceovers...")
 
     for i, seg in enumerate(segments):
         audio_file = os.path.join(temp_dir, f"audio_{i}.mp3")
@@ -106,7 +121,7 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
 # 4. 🎬 Dynamic Video Stretching & Audio Mixing
 # ==========================================
 def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: str):
-    print("🎬 Calculating dynamic timeline & pre-mixing audio...")
+    print("🎬 Calculating lightweight timeline & pre-mixing audio...")
     total_video_dur = get_duration(video_path)
     
     filter_lines = []
@@ -160,7 +175,7 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
     with open(script_path, "w") as f:
         f.write("\n".join(filter_lines))
 
-    # 🎛️ Pre-mix all audio tracks into a SINGLE master audio file using Pydub (saves massive RAM)
+    # Pre-mix master audio track using Pydub
     print("🎧 Compiling master audio track...")
     total_audio_dur_ms = int((current_new_time + 2.0) * 1000)
     master_audio = AudioSegment.silent(duration=total_audio_dur_ms)
@@ -173,7 +188,7 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
     master_audio_path = "master_output_audio.wav"
     master_audio.export(master_audio_path, format="wav")
 
-    # 🎬 Clean FFmpeg run with only 2 inputs (1 Video, 1 Audio)
+    # Clean FFmpeg run
     print("✨ Encoding final MP4...")
     cmd = [
         'ffmpeg', '-y',
