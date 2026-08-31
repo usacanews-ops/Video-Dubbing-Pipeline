@@ -2,6 +2,7 @@ import os
 import sys
 import subprocess
 import asyncio
+import time
 import yt_dlp
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
@@ -14,7 +15,6 @@ def download_media(url: str) -> tuple[str, str]:
     video_path = "input_video.mp4"
     audio_path = "input_audio.wav"
 
-    # Remove existing files from previous runs
     for path in [video_path, audio_path]:
         if os.path.exists(path):
             os.remove(path)
@@ -26,11 +26,10 @@ def download_media(url: str) -> tuple[str, str]:
         'no_warnings': True,
     }
 
-    print("📥 Downloading video from URL...")
+    print("📥 Downloading video...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-    # Extract 16kHz mono WAV for Whisper processing
     print("🎵 Extracting audio track...")
     subprocess.run([
         'ffmpeg', '-y', '-i', video_path,
@@ -57,14 +56,18 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
         if not text:
             continue
 
-        # Safe translation with fallback
-        try:
-            translated = translator.translate(text)
-            if not translated:
-                translated = text
-        except Exception as err:
-            print(f"⚠️ Translation skipped for: \"{text[:30]}...\" | Reason: {err}")
-            translated = text  # Fallback to English original if error occurs
+        translated = text  # Default to original English if translation completely fails
+        
+        # Retry loop to handle GitHub Actions IP rate-limiting
+        for attempt in range(3):
+            try:
+                result = translator.translate(text)
+                if result:
+                    translated = result
+                    break  # Success, exit the retry loop
+            except Exception as e:
+                print(f"⚠️ Translation attempt {attempt + 1} failed for: '{text[:20]}...' | Retrying in 2s...")
+                time.sleep(2)  # Wait 2 seconds before retrying to clear the rate limit
 
         transcript.append({
             "start": s.start,
@@ -91,12 +94,10 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
         communicate = edge_tts.Communicate(seg["translated_text"], "hi-IN-MadhurNeural")
         await communicate.save(raw_file)
 
-        # Measure generated audio duration
         probe_cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {raw_file}"
         gen_duration = float(subprocess.check_output(probe_cmd, shell=True).strip())
         target_duration = seg["duration"]
 
-        # Calculate time-stretch factor to match timestamps
         speed_factor = max(0.7, min(gen_duration / target_duration, 2.0)) if target_duration > 0 else 1.0
 
         subprocess.run([
@@ -107,7 +108,7 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 # ==========================================
-# 4. 🎬 Video Assembly & Metadata Stripping
+# 4. 🎬 Video Assembly
 # ==========================================
 def merge_video(video_path: str, segments: list[dict], output_file: str, video_speed: float):
     print("🎬 Mixing audio channels and compiling MP4...")
@@ -132,7 +133,7 @@ def merge_video(video_path: str, segments: list[dict], output_file: str, video_s
         '-map', '0:v',
         '-map', '[aout]',
         '-vf', f'setpts={pts_factor}*PTS',
-        '-map_metadata', '-1',  # 🚫 Strip all metadata
+        '-map_metadata', '-1',
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-c:a', 'aac',
@@ -141,9 +142,6 @@ def merge_video(video_path: str, segments: list[dict], output_file: str, video_s
     subprocess.run(cmd, check=True)
     print(f"✨ Rendering complete: {output_file}")
 
-# ==========================================
-# 🚀 Entry Point
-# ==========================================
 if __name__ == "__main__":
     url = sys.argv[1]
     target_lang = sys.argv[2] if len(sys.argv) > 2 else "hi"
