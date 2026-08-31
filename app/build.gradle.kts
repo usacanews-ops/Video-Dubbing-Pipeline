@@ -14,6 +14,16 @@ android {
         versionCode = 1
         versionName = "1.0"
     }
+
+    // Explicitly set JVM target to 17 to fix the compiler mismatch
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
     buildFeatures {
         compose = true
     }
