@@ -53,9 +53,9 @@ fun DubberLiveApp() {
 
     val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
 
-    var githubOwner by remember { mutableStateOf(prefs.getString("owner", "") ?: "") }
-    var githubRepo by remember { mutableStateOf(prefs.getString("repo", "") ?: "") }
-    var githubToken by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
+    var githubOwner by remember { mutableStateOf(prefs.getString("owner", "YOUR_USERNAME") ?: "YOUR_USERNAME") }
+    var githubRepo by remember { mutableStateOf(prefs.getString("repo", "YOUR_REPO_NAME") ?: "YOUR_REPO_NAME") }
+    var githubToken by remember { mutableStateOf(prefs.getString("token", "YOUR_GITHUB_TOKEN") ?: "YOUR_GITHUB_TOKEN") }
 
     var videoUrl by remember { mutableStateOf("") }
     var selectedLanguage by remember { mutableStateOf("hi") }
