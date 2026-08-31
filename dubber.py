@@ -174,7 +174,7 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
     with open(script_path, "w") as f:
         f.write("\n".join(filter_lines))
 
-    # Run FFmpeg compilation
+    # Run FFmpeg compilation with ultrafast encoding preset
     print("✨ Mixing audio and encoding final MP4...")
     cmd = ['ffmpeg', '-y', '-i', video_path]
     for seg in segments:
@@ -186,7 +186,7 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
         '-map', '[aout]',
         '-map_metadata', '-1',
         '-c:v', 'libx264',
-        '-preset', 'fast',
+        '-preset', 'ultrafast',
         '-c:a', 'aac',
         output_file
     ])
