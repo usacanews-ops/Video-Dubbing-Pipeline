@@ -3,3 +3,4 @@ faster-whisper
 deep-translator
 edge-tts
 asyncio
+pydub
