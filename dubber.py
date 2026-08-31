@@ -7,6 +7,7 @@ import yt_dlp
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
 import edge_tts
+from pydub import AudioSegment
 
 # ==========================================
 # 1. 📥 Download Video & Extract Audio
@@ -76,7 +77,7 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
             "translated_text": translated
         })
 
-    # Sanitize overlapping timestamps (Whisper sometimes bleeds them)
+    # Sanitize overlapping timestamps
     for i in range(1, len(segments)):
         if segments[i]['start'] < segments[i-1]['end']:
             segments[i]['start'] = segments[i-1]['end']
@@ -102,10 +103,10 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
         seg["tts_dur"] = get_duration(audio_file)
 
 # ==========================================
-# 4. 🎬 Dynamic Video Stretching & Assembly
+# 4. 🎬 Dynamic Video Stretching & Audio Mixing
 # ==========================================
 def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: str):
-    print("🎬 Calculating dynamic timeline (slowing video to match audio)...")
+    print("🎬 Calculating dynamic timeline & pre-mixing audio...")
     total_video_dur = get_duration(video_path)
     
     filter_lines = []
@@ -128,10 +129,10 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
             part_idx += 1
             current_new_time += gap_dur
 
-        # 2. Process Dialogue Segment (Slow down video if TTS is longer)
+        # 2. Process Dialogue Segment
         factor = 1.0
         if tts_dur > orig_dur:
-            factor = tts_dur / orig_dur  # Calculate slow-motion factor
+            factor = tts_dur / orig_dur
             actual_seg_dur = tts_dur
         else:
             actual_seg_dur = orig_dur
@@ -140,7 +141,6 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
         video_concat_inputs.append(f"[vpart{part_idx}]")
         part_idx += 1
 
-        # Save the new timestamps for the SRT file
         seg['new_start'] = current_new_time
         seg['new_end'] = current_new_time + tts_dur
 
@@ -153,47 +153,47 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
         video_concat_inputs.append(f"[vpart{part_idx}]")
         part_idx += 1
 
-    # Concatenate all video parts
     concat_v = "".join(video_concat_inputs)
     filter_lines.append(f"{concat_v}concat=n={part_idx}:v=1:a=0[vout];")
 
-    # Map audio files to new timestamps
-    audio_inputs = []
-    for i, seg in enumerate(segments):
-        start_ms = int(seg['new_start'] * 1000)
-        input_idx = i + 1  # 0 is video
-        filter_lines.append(f"[{input_idx}:a]adelay={start_ms}|{start_ms}[a{i}];")
-        audio_inputs.append(f"[a{i}]")
-
-    amix_str = "".join(audio_inputs)
-    filter_lines.append(f"{amix_str}amix=inputs={len(audio_inputs)}:normalize=0[aout];")
-
-    # Save filter script locally
     script_path = "filter_script.txt"
     with open(script_path, "w") as f:
         f.write("\n".join(filter_lines))
 
-    # Run FFmpeg compilation with strict video bitrate capping
-    print("✨ Mixing audio and encoding compressed MP4...")
-    cmd = ['ffmpeg', '-y', '-i', video_path]
-    for seg in segments:
-        cmd.extend(['-i', seg['audio_file']])
+    # 🎛️ Pre-mix all audio tracks into a SINGLE master audio file using Pydub (saves massive RAM)
+    print("🎧 Compiling master audio track...")
+    total_audio_dur_ms = int((current_new_time + 2.0) * 1000)
+    master_audio = AudioSegment.silent(duration=total_audio_dur_ms)
 
-    cmd.extend([
+    for seg in segments:
+        seg_audio = AudioSegment.from_file(seg['audio_file'])
+        start_ms = int(seg['new_start'] * 1000)
+        master_audio = master_audio.overlay(seg_audio, position=start_ms)
+
+    master_audio_path = "master_output_audio.wav"
+    master_audio.export(master_audio_path, format="wav")
+
+    # 🎬 Clean FFmpeg run with only 2 inputs (1 Video, 1 Audio)
+    print("✨ Encoding final MP4...")
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', video_path,
+        '-i', master_audio_path,
         '-filter_complex_script', script_path,
         '-map', '[vout]',
-        '-map', '[aout]',
+        '-map', '1:a',
         '-map_metadata', '-1',
         '-c:v', 'libx264',
         '-preset', 'veryfast',
-        '-b:v', '2500k',       # 🗜️ Forces video bitrate to ~2.5 Mbps (prevents massive file explosion)
+        '-b:v', '2500k',
         '-maxrate', '3000k',
         '-bufsize', '6000k',
         '-c:a', 'aac',
         '-b:a', '192k',
         output_file
-    ])
+    ]
     subprocess.run(cmd, check=True)
+
 # ==========================================
 # 5. 📝 Subtitle (.srt) Generation
 # ==========================================
@@ -220,8 +220,5 @@ if __name__ == "__main__":
     segs = transcribe_and_translate(a_file, target_lang=target_lang)
     asyncio.run(synthesize_audio(segs))
     
-    # Render stretched video timeline first
     build_ffmpeg_timeline(v_file, segs, "final_output.mp4")
-    
-    # Generate SRT last, so it reads the new timestamps calculated during video stretch
     generate_srt(segs, "subtitles.srt")
