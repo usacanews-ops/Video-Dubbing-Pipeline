@@ -124,8 +124,8 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
         seg["new_start"] = start_time
         seg["new_end"] = start_time + seg["tts_dur"]
         
-        # 0.2s padding prevents edge-to-edge audio collision
-        timeline_cursor = seg["new_end"] + 0.2
+        # 0.1s padding prevents edge-to-edge audio collision
+        timeline_cursor = seg["new_end"] + 0.1
 
     final_audio_dur = max(orig_total_dur, timeline_cursor)
 
