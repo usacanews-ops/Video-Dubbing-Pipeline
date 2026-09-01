@@ -47,25 +47,11 @@ jobs:
         run: |
           python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}"
 
-      - name: ⚡ Generate Direct High-Speed Download Links
-        run: |
-          echo "==========================================="
-          echo "🎥 FAST DIRECT VIDEO DOWNLOAD LINK (Litterbox CDN):"
-          curl -s -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@final_output.mp4" https://litterbox.catbox.moe/resources/internals/api.php
-          echo ""
-          echo "📝 FAST DIRECT SUBTITLES LINK:"
-          curl -s -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@subtitles.srt" https://litterbox.catbox.moe/resources/internals/api.php
-          echo ""
-          echo "==========================================="
-
-      - name: 🏷️ Publish to GitHub Release (Direct CDN Link)
-        uses: softprops/action-gh-release@v2
-        if: always()
+      - name: 📤 Upload Dubbed Output Artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: run-${{ github.run_number }}
-          name: Dubbed Output Run #${{ github.run_number }}
-          files: |
+          name: dubbed-video-package
+          path: |
             final_output.mp4
             subtitles.srt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          retention-days: 1
