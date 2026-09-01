@@ -26,10 +26,12 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 🎬 Setup FFmpeg (Fast Cache)
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        with:
-          architecture: linux64
+      - name: 🎬 Install FFmpeg (Lightning Fast Static Build)
+        run: |
+          wget -q https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          tar -xf ffmpeg-release-amd64-static.tar.xz
+          sudo mv ffmpeg-*-static/ffmpeg /usr/local/bin/
+          sudo mv ffmpeg-*-static/ffprobe /usr/local/bin/
 
       - name: 📦 Update yt-dlp & Install Requirements
         run: |
