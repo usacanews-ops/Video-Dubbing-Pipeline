@@ -43,21 +43,20 @@ jobs:
         run: |
           python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}"
 
-      - name: ⚡ Generate Fast Download Links
+      - name: ⚡ Generate Direct High-Speed Download Links
         run: |
           echo "==========================================="
-          echo "🎥 FAST DOWNLOAD LINK (Pixeldrain):"
-          curl -s -T final_output.mp4 https://pixeldrain.com/api/file/ | jq -r '"https://pixeldrain.com/u/" + .id' || true
+          echo "🎥 FAST DIRECT VIDEO DOWNLOAD LINK (Litterbox CDN):"
+          curl -s -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@final_output.mp4" https://litterbox.catbox.moe/resources/internals/api.php
           echo ""
-          echo "🎥 FAST DOWNLOAD LINK (0x0.st):"
-          curl -s -F 'file=@final_output.mp4' https://0x0.st || true
+          echo "📝 FAST DIRECT SUBTITLES LINK:"
+          curl -s -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@subtitles.srt" https://litterbox.catbox.moe/resources/internals/api.php
           echo ""
-          echo "📝 SUBTITLES LINK (0x0.st):"
-          curl -s -F 'file=@subtitles.srt' https://0x0.st || true
           echo "==========================================="
 
-      - name: 🏷️ Publish to GitHub Release (High-Speed Direct Link)
+      - name: 🏷️ Publish to GitHub Release (Direct CDN Link)
         uses: softprops/action-gh-release@v2
+        if: always()
         with:
           tag_name: run-${{ github.run_number }}
           name: Dubbed Output Run #${{ github.run_number }}
