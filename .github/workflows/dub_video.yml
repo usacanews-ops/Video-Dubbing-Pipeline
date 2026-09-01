@@ -44,14 +44,17 @@ jobs:
       - name: ⚡ Upload to High-Speed Server (Bypass GitHub Slow DL)
         run: |
           echo "==========================================="
-          echo "🎥 DOWNLOADING VIDEO FILE (FAST SPEED):"
-          curl -T final_output.mp4 https://bashupload.com/final_output.mp4
+          echo "🎥 FAST DOWNLOAD LINK (TMPFILES):"
+          curl -s -F "file=@final_output.mp4" https://tmpfiles.org/api/v1/upload | jq -r '.data.url' | sed 's/tmpfiles.org\//tmpfiles.org\/dl\//'
           echo ""
-          echo "📝 DOWNLOADING SUBTITLE FILE:"
-          curl -T subtitles.srt https://bashupload.com/subtitles.srt
+          echo "🎥 BACKUP FAST LINK (FILE.IO):"
+          curl -s -F "file=@final_output.mp4" https://file.io | jq -r '.link'
+          echo ""
+          echo "📝 SUBTITLES FAST LINK:"
+          curl -s -F "file=@subtitles.srt" https://file.io | jq -r '.link'
           echo "==========================================="
 
-      - name: 📤 Upload Dubbed Video to GitHub (Backup)
+      - name: 📤 Upload Dubbed Video to GitHub (Artifact Backup)
         uses: actions/upload-artifact@v4
         with:
           name: dubbed-video-package
