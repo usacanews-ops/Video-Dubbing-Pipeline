@@ -57,24 +57,26 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
 
     for s in raw_segments:
         text = s.text.strip()
-        if text:
-            raw_list.append({"start": s.start, "end": s.end, "text": text})
+        if text and (s.end - s.start >= 0.2):
+            raw_list.append({"start": round(s.start, 2), "end": round(s.end, 2), "text": text})
 
     if not raw_list:
         return []
 
-    # Clean & ensure monotonic timestamps
-    sanitized = [raw_list[0]]
+    # Merge consecutive micro-segments (< 0.3s apart) to prevent 0-length video slices
+    merged = [raw_list[0]]
     for s in raw_list[1:]:
-        prev = sanitized[-1]
-        start = max(s["start"], prev["end"])
-        end = max(s["end"], start + 0.5)
-        sanitized.append({"start": start, "end": end, "text": s["text"]})
+        prev = merged[-1]
+        if s["start"] - prev["end"] < 0.3:
+            prev["end"] = max(prev["end"], s["end"])
+            prev["text"] += " " + s["text"]
+        else:
+            merged.append(s)
 
-    # Translate
+    # Translate merged blocks
     segments = []
-    print(f"🌐 Translating {len(sanitized)} segments into '{target_lang}'...")
-    for s in sanitized:
+    print(f"🌐 Translating {len(merged)} segments into '{target_lang}'...")
+    for s in merged:
         translated = s["text"]
         for _ in range(3):
             try:
@@ -95,26 +97,26 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     return segments
 
 # ==========================================
-# 3. 🗣️ Speech Synthesis (+10% Natural Rate)
+# 3. 🗣️ Speech Synthesis (+15% Rate)
 # ==========================================
 async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
     os.makedirs(temp_dir, exist_ok=True)
-    print("🗣️ Synthesizing voiceover audio...")
+    print("🗣️ Synthesizing voiceovers (Speed +15%)...")
 
     for i, seg in enumerate(segments):
         audio_file = os.path.join(temp_dir, f"audio_{i}.mp3")
         seg["audio_file"] = audio_file
 
-        communicate = edge_tts.Communicate(seg["translated_text"], "hi-IN-MadhurNeural", rate="+10%")
+        communicate = edge_tts.Communicate(seg["translated_text"], "hi-IN-MadhurNeural", rate="+15%")
         await communicate.save(audio_file)
 
         seg["tts_dur"] = get_duration(audio_file)
 
 # ==========================================
-# 4. 🎬 Sequential Timeline Engine (Zero Overlap)
+# 4. 🎬 Sequential Timeline Engine (Zero Overlap & Valid Filters)
 # ==========================================
 def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: str):
-    print("🎬 Building strict sequential timeline (pushing downstream segments)...")
+    print("🎬 Building robust video timeline...")
     total_video_dur = get_duration(video_path)
 
     filter_lines = []
@@ -128,34 +130,34 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
         orig_start = seg["orig_start"]
         orig_end = seg["orig_end"]
         tts_dur = seg["tts_dur"]
-        orig_dur = seg["orig_dur"]
+        orig_dur = max(0.1, orig_end - orig_start)
 
-        # 1. Non-speech gap before this segment
-        if orig_start > last_orig_end:
+        # 1. Non-speech gap (only if gap is >= 0.1s to prevent 0-length filter errors)
+        if orig_start - last_orig_end >= 0.1:
             gap_dur = orig_start - last_orig_end
-            filter_lines.append(f"[0:v]trim=start={last_orig_end:.3f}:end={orig_start:.3f},setpts=PTS-STARTPTS,fps=30[vpart{part_idx}];")
+            filter_lines.append(f"[0:v]trim=start={last_orig_end:.2f}:end={orig_start:.2f},setpts=PTS-STARTPTS,fps=30[vpart{part_idx}];")
             video_concat_inputs.append(f"[vpart{part_idx}]")
             part_idx += 1
             current_timeline_time += gap_dur
 
-        # 2. Speech segment: ensure video lasts AT LEAST as long as TTS duration
-        actual_seg_dur = max(orig_dur, tts_dur + 0.15)  # 0.15s breathing buffer
-        stretch_factor = actual_seg_dur / orig_dur if orig_dur > 0 else 1.0
+        # 2. Speech segment: ensure video covers full audio + 0.1s safety padding
+        actual_seg_dur = max(orig_dur, tts_dur + 0.1)
+        stretch_factor = actual_seg_dur / orig_dur
 
-        filter_lines.append(f"[0:v]trim=start={orig_start:.3f}:end={orig_end:.3f},setpts={stretch_factor:.4f}*(PTS-STARTPTS),fps=30[vpart{part_idx}];")
+        filter_lines.append(f"[0:v]trim=start={orig_start:.2f}:end={orig_end:.2f},setpts={stretch_factor:.4f}*(PTS-STARTPTS),fps=30[vpart{part_idx}];")
         video_concat_inputs.append(f"[vpart{part_idx}]")
         part_idx += 1
 
-        # Strict start position: never overlaps with prior audio
+        # Strict non-overlapping placement
         seg["new_start"] = current_timeline_time
         seg["new_end"] = current_timeline_time + tts_dur
 
         current_timeline_time += actual_seg_dur
         last_orig_end = orig_end
 
-    # Remaining video trailing tail
-    if last_orig_end < total_video_dur:
-        filter_lines.append(f"[0:v]trim=start={last_orig_end:.3f}:end={total_video_dur:.3f},setpts=PTS-STARTPTS,fps=30[vpart{part_idx}];")
+    # Trailing tail
+    if total_video_dur - last_orig_end >= 0.1:
+        filter_lines.append(f"[0:v]trim=start={last_orig_end:.2f}:end={total_video_dur:.2f},setpts=PTS-STARTPTS,fps=30[vpart{part_idx}];")
         video_concat_inputs.append(f"[vpart{part_idx}]")
         part_idx += 1
 
@@ -166,8 +168,8 @@ def build_ffmpeg_timeline(video_path: str, segments: list[dict], output_file: st
     with open(script_path, "w") as f:
         f.write("\n".join(filter_lines))
 
-    # 🎛️ Audio Assembly (Guaranteed Non-Overlapping)
-    print("🎧 Pre-rendering non-overlapping audio master...")
+    # 🎛️ Audio Assembly
+    print("🎧 Pre-rendering audio master track...")
     total_audio_ms = int((current_timeline_time + 2.0) * 1000)
     master_audio = AudioSegment.silent(duration=total_audio_ms)
 
