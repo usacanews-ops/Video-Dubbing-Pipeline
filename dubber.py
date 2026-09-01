@@ -79,18 +79,20 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     return segments
 
 # ==========================================
-# 3. 🗣️ Speech Synthesis
+# 3. 🗣️ Speech Synthesis (15% Faster)
 # ==========================================
 async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
     os.makedirs(temp_dir, exist_ok=True)
-    print("🗣️ Synthesizing voiceovers...")
+    print("🗣️ Synthesizing voiceovers (Speed +15%)...")
 
     for i, seg in enumerate(segments):
         audio_file = os.path.join(temp_dir, f"audio_{i}.mp3")
         seg["audio_file"] = audio_file
 
-        communicate = edge_tts.Communicate(seg["translated_text"], "hi-IN-MadhurNeural")
+        # ⏩ Increases audio speed by 15% to prevent Hindi from bleeding over
+        communicate = edge_tts.Communicate(seg["translated_text"], "hi-IN-MadhurNeural", rate="+15%")
         await communicate.save(audio_file)
+
         seg["tts_dur"] = get_duration(audio_file)
 
 # ==========================================
