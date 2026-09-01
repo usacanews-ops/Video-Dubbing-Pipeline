@@ -117,19 +117,56 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     return segments
 
 # ==========================================
-# 3. 🗣️ Speech Synthesis (+15% Rate)
+# 3. 🗣️ Speech Synthesis (+15% Rate & Safe Fallback)
 # ==========================================
-async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
+async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio", voice: str = "hi-IN-MadhurNeural"):
     os.makedirs(temp_dir, exist_ok=True)
     print("🗣️ Synthesizing voiceovers...")
 
+    valid_segments = []
+
     for i, seg in enumerate(segments):
         audio_file = os.path.join(temp_dir, f"audio_{i}.mp3")
-        seg["audio_file"] = audio_file
+        text = seg["translated_text"].strip()
 
-        communicate = edge_tts.Communicate(seg["translated_text"], "hi-IN-MadhurNeural", rate="+15%")
-        await communicate.save(audio_file)
-        seg["tts_dur"] = get_duration(audio_file)
+        # Sanitize text (remove non-alphanumeric noise Whisper sometimes creates)
+        text = text.replace("[", "").replace("]", "").replace("(", "").replace(")", "").strip()
+
+        if not text or len(text) < 2 or text in [".", ",", "?", "!"]:
+            # Create a 0.5-second silent dummy MP3 if text is empty
+            silent = AudioSegment.silent(duration=500)
+            silent.export(audio_file, format="mp3")
+            seg["audio_file"] = audio_file
+            seg["tts_dur"] = 0.5
+            valid_segments.append(seg)
+            continue
+
+        seg["audio_file"] = audio_file
+        success = False
+
+        for attempt in range(3):
+            try:
+                communicate = edge_tts.Communicate(text, voice, rate="+15%")
+                await communicate.save(audio_file)
+                seg["tts_dur"] = get_duration(audio_file)
+                success = True
+                break
+            except Exception as e:
+                print(f"⚠️ TTS attempt {attempt + 1} failed for text: '{text[:25]}...' - {e}")
+                await asyncio.sleep(1.5)
+
+        # If Edge TTS fails all attempts, generate clean silence so the pipeline never crashes
+        if not success or not os.path.exists(audio_file) or os.path.getsize(audio_file) == 0:
+            print(f"⚠️ Fallback to silence for segment {i}")
+            fallback_dur = max(0.5, seg["orig_end"] - seg["orig_start"])
+            silent = AudioSegment.silent(duration=int(fallback_dur * 1000))
+            silent.export(audio_file, format="mp3")
+            seg["tts_dur"] = fallback_dur
+
+        valid_segments.append(seg)
+
+    segments.clear()
+    segments.extend(valid_segments)
 
 # ==========================================
 # 4. 🎬 Global Timeline Sync & Render
