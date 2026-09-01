@@ -26,8 +26,10 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 🎬 Install FFmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: 🎬 Setup FFmpeg (Fast Cache)
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          architecture: linux64
 
       - name: 📦 Update yt-dlp & Install Requirements
         run: |
