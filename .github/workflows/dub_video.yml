@@ -39,7 +39,17 @@ jobs:
         run: |
           python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}"
 
-      - name: 📤 Upload Dubbed Video and Subtitles
+      - name: ⚡ Upload to High-Speed Server (Bypass GitHub Slow DL)
+        run: |
+          echo "==========================================="
+          echo "🎥 DOWNLOADING VIDEO FILE (FAST SPEED):"
+          curl -T final_output.mp4 https://bashupload.com/final_output.mp4
+          echo ""
+          echo "📝 DOWNLOADING SUBTITLE FILE:"
+          curl -T subtitles.srt https://bashupload.com/subtitles.srt
+          echo "==========================================="
+
+      - name: 📤 Upload Dubbed Video to GitHub (Backup)
         uses: actions/upload-artifact@v4
         with:
           name: dubbed-video-package
