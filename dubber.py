@@ -8,7 +8,7 @@ from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
 import edge_tts
 from pydub import AudioSegment
-
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 # ==========================================
 # 1. Download Media & Extract Audio
 # ==========================================
@@ -47,23 +47,52 @@ def get_duration(file_path: str) -> float:
 # ==========================================
 # 2. Transcription & Translation
 # ==========================================
+def translate_text_robust(text: str, target_lang: str) -> str:
+    """Attempts multiple free translation backends to bypass cloud IP blocks."""
+    # Attempt 1: Google Translator
+    try:
+        res = GoogleTranslator(source='auto', target=target_lang).translate(text)
+        if res and res.strip() and res.strip() != text.strip():
+            return res
+    except Exception as e:
+        print(f"⚠️ Google Translate failed: {e}")
+
+    # Attempt 2: MyMemory Translator (Different API provider)
+    try:
+        res = MyMemoryTranslator(source='en', target=target_lang).translate(text)
+        if res and res.strip() and res.strip() != text.strip():
+            return res
+    except Exception as e:
+        print(f"⚠️ MyMemory Translate failed: {e}")
+
+    # Attempt 3: Retry with basic cleanup
+    try:
+        clean_text = text.replace('"', '').replace("'", "")
+        res = GoogleTranslator(source='en', target=target_lang).translate(clean_text)
+        if res and res.strip():
+            return res
+    except Exception:
+        pass
+
+    print(f"❌ All translators failed for: '{text[:30]}...'")
+    return text
+
 def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[dict]:
-    print("Transcribing audio with faster-whisper...")
+    print("🎙️ Transcribing audio with faster-whisper...")
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
     raw_segments, _ = model.transcribe(audio_path, language="en", vad_filter=True)
 
-    translator = GoogleTranslator(source='en', target=target_lang)
     raw_list = []
-
     for s in raw_segments:
         text = s.text.strip()
         if text and (s.end - s.start >= 0.2):
             raw_list.append({"start": s.start, "end": s.end, "text": text})
 
     if not raw_list:
+        print("⚠️ No speech detected in audio.")
         return []
 
-    # Merge adjacent segments separated by < 0.5s into cohesive thoughts
+    # Merge consecutive micro-segments (< 0.5s) for natural sentence flow
     merged = [raw_list[0]]
     for s in raw_list[1:]:
         prev = merged[-1]
@@ -74,17 +103,11 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
             merged.append(s)
 
     segments = []
-    print(f"Translating {len(merged)} segments to '{target_lang}'...")
-    for s in merged:
-        translated = s["text"]
-        for _ in range(3):
-            try:
-                res = translator.translate(s["text"])
-                if res:
-                    translated = res
-                    break
-            except Exception:
-                time.sleep(1)
+    print(f"🌐 Translating {len(merged)} dialogue chunks into '{target_lang}'...")
+    for i, s in enumerate(merged, start=1):
+        translated = translate_text_robust(s["text"], target_lang)
+        print(f"[{i}/{len(merged)}] EN: {s['text']}")
+        print(f"       -> HI: {translated}")
 
         segments.append({
             "orig_start": s["start"],
@@ -93,7 +116,6 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
         })
 
     return segments
-
 # ==========================================
 # 3. Speech Synthesis
 # ==========================================
