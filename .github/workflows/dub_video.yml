@@ -11,6 +11,10 @@ on:
         description: 'Target Language Code (e.g., hi, es, fr)'
         required: true
         default: 'hi'
+      video_speed:
+        description: 'Playback Speed Factor'
+        required: false
+        default: '1.0'
 
 jobs:
   dub:
