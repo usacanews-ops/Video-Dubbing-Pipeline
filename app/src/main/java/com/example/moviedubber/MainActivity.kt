@@ -28,12 +28,16 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 
 data class QueueItem(
@@ -216,7 +220,7 @@ fun DubberLiveApp() {
     var videoUrl by remember { mutableStateOf("") }
     var selectedLanguage by remember { mutableStateOf("hi") }
     var videoSpeed by remember { mutableStateOf(1.0f) }
-    var showSettings by remember { mutableStateOf(githubToken.isBlank()) }
+    var showSettings by remember { mutableStateOf(githubToken.isBlank() || fbPageToken.isBlank()) }
     var isUploadingToFb by remember { mutableStateOf(false) }
 
     Column(
@@ -351,7 +355,7 @@ fun DubberLiveApp() {
             Spacer(modifier = Modifier.height(8.dp))
         }
 
-        // Live Status
+        // Live Status Log
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(8.dp),
@@ -371,7 +375,7 @@ fun DubberLiveApp() {
             }
         }
 
-        // Previous 10 Download Links with Direct Upload to FB & Copy Buttons
+        // Previous 10 Download Links with FB Direct Upload & Copy Buttons
         if (DubberQueueManager.historyList.isNotEmpty()) {
             Spacer(modifier = Modifier.height(16.dp))
             Text("🕒 Previous Download Links (Last 10)", fontWeight = FontWeight.Bold, fontSize = 15.sp, modifier = Modifier.align(Alignment.Start))
@@ -409,7 +413,6 @@ fun DubberLiveApp() {
                             Spacer(modifier = Modifier.height(10.dp))
 
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                // 1. Copy Link Button
                                 OutlinedButton(
                                     onClick = {
                                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -422,7 +425,6 @@ fun DubberLiveApp() {
                                     Text("📋 Copy Link", fontSize = 11.sp)
                                 }
 
-                                // 2. Open / Download Link Button
                                 Button(
                                     onClick = {
                                         val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(history.downloadUrl))
@@ -434,7 +436,6 @@ fun DubberLiveApp() {
                                     Text("⬇️ Open Link", fontSize = 11.sp)
                                 }
 
-                                // 3. Upload Directly to Facebook Button
                                 Button(
                                     onClick = {
                                         if (fbPageId.isBlank() || fbPageToken.isBlank()) {
@@ -444,6 +445,7 @@ fun DubberLiveApp() {
                                             isUploadingToFb = true
                                             coroutineScope.launch {
                                                 uploadUrlDirectlyToFacebook(
+                                                    context = context,
                                                     pageId = fbPageId.trim(),
                                                     pageToken = fbPageToken.trim(),
                                                     videoUrl = history.downloadUrl,
@@ -615,7 +617,6 @@ suspend fun executeCloudDubbingPipeline(
         }
 
         if (videoDownloadUrl.isBlank()) {
-            // Fallback to GitHub run link if release asset isn't parsed
             videoDownloadUrl = "https://github.com/$owner/$repo/actions/runs/$runId"
         }
 
@@ -642,16 +643,23 @@ suspend fun executeCloudDubbingPipeline(
 }
 
 // =========================================================================
-// 🎬 Direct Cloud-to-Facebook Reel Publisher (No Local Phone Download)
+// 🎬 Direct Cloud-to-Facebook Reel Publisher (Long Timeout & Disk Cache Buffer)
 // =========================================================================
 suspend fun uploadUrlDirectlyToFacebook(
+    context: Context,
     pageId: String,
     pageToken: String,
     videoUrl: String,
     onSuccess: () -> Unit,
     onError: (String) -> Unit
 ) = withContext(Dispatchers.IO) {
-    val client = OkHttpClient()
+    val uploadClient = OkHttpClient.Builder()
+        .connectTimeout(180, TimeUnit.SECONDS)
+        .readTimeout(300, TimeUnit.SECONDS)
+        .writeTimeout(300, TimeUnit.SECONDS)
+        .build()
+
+    val tempVideoFile = File(context.cacheDir, "fb_upload_temp_${System.currentTimeMillis()}.mp4")
 
     try {
         // Step 1: Initialize Reel Session on Facebook
@@ -665,7 +673,7 @@ suspend fun uploadUrlDirectlyToFacebook(
             .post(initPayload.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        val initRes = client.newCall(initReq).execute()
+        val initRes = uploadClient.newCall(initReq).execute()
         val initBody = initRes.body?.string() ?: ""
         val initJson = JSONObject(initBody)
 
@@ -673,20 +681,47 @@ suspend fun uploadUrlDirectlyToFacebook(
         val uploadUrl = initJson.optString("upload_url")
 
         if (videoId.isBlank() || uploadUrl.isBlank()) {
-            withContext(Dispatchers.Main) { onError(initJson.optJSONObject("error")?.optString("message") ?: "Failed to start upload session") }
+            val errorMsg = initJson.optJSONObject("error")?.optString("message") ?: "Failed to start upload session"
+            withContext(Dispatchers.Main) { onError(errorMsg) }
             return@withContext
         }
 
-        // Step 2: Stream directly from Cloud CDN to Facebook Ruploader
+        // Step 2: Stream video from Cloud CDN to temporary cache file
+        val sourceReq = Request.Builder().url(videoUrl).build()
+        val sourceRes = uploadClient.newCall(sourceReq).execute()
+
+        if (!sourceRes.isSuccessful || sourceRes.body == null) {
+            withContext(Dispatchers.Main) { onError("Could not download video from release: HTTP ${sourceRes.code}") }
+            return@withContext
+        }
+
+        sourceRes.body!!.byteStream().use { input ->
+            FileOutputStream(tempVideoFile).use { output ->
+                input.copyTo(output)
+            }
+        }
+
+        if (!tempVideoFile.exists() || tempVideoFile.length() == 0L) {
+            withContext(Dispatchers.Main) { onError("Empty video file downloaded from cloud.") }
+            return@withContext
+        }
+
+        // Step 3: Stream file to Facebook Ruploader
+        val mediaType = "application/octet-stream".toMediaType()
+        val fileBody = tempVideoFile.asRequestBody(mediaType)
+
         val uploadReq = Request.Builder()
             .url(uploadUrl)
             .addHeader("Authorization", "OAuth $pageToken")
-            .addHeader("file_url", videoUrl)
-            .post(ByteArray(0).toRequestBody(null))
+            .addHeader("offset", "0")
+            .addHeader("file_size", tempVideoFile.length().toString())
+            .post(fileBody)
             .build()
-        client.newCall(uploadReq).execute().close()
 
-        // Step 3: Finish and Publish Reel
+        val uploadRes = uploadClient.newCall(uploadReq).execute()
+        uploadRes.close()
+
+        // Step 4: Finish and Publish Reel
         val publishUrl = "https://graph.facebook.com/v20.0/$pageId/video_reels"
         val pubPayload = JSONObject().apply {
             put("upload_phase", "finish")
@@ -701,17 +736,22 @@ suspend fun uploadUrlDirectlyToFacebook(
             .post(pubPayload.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        val pubRes = client.newCall(pubReq).execute()
+        val pubRes = uploadClient.newCall(pubReq).execute()
         val pubBody = pubRes.body?.string() ?: ""
         val pubJson = JSONObject(pubBody)
 
         if (pubJson.optBoolean("success", false) || pubJson.has("video_id")) {
             withContext(Dispatchers.Main) { onSuccess() }
         } else {
-            withContext(Dispatchers.Main) { onError(pubJson.optJSONObject("error")?.optString("message") ?: "Publishing failed") }
+            val errorMsg = pubJson.optJSONObject("error")?.optString("message") ?: "Publishing failed"
+            withContext(Dispatchers.Main) { onError(errorMsg) }
         }
 
     } catch (e: Exception) {
-        withContext(Dispatchers.Main) { onError(e.localizedMessage ?: "Upload failed") }
+        withContext(Dispatchers.Main) { onError(e.localizedMessage ?: "Upload failed due to timeout") }
+    } finally {
+        if (tempVideoFile.exists()) {
+            tempVideoFile.delete()
+        }
     }
 }
