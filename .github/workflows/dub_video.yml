@@ -32,10 +32,9 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 🎬 Install FFmpeg (Direct High-Speed Binary)
+      - name: 🎬 Install FFmpeg
         run: |
           curl -sL https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | sudo tar -xJ --strip-components=2 -C /usr/local/bin/ ffmpeg-master-latest-linux64-gpl/bin/ffmpeg ffmpeg-master-latest-linux64-gpl/bin/ffprobe
-          ffmpeg -version
 
       - name: 📦 Update yt-dlp & Install Requirements
         run: |
@@ -47,11 +46,13 @@ jobs:
         run: |
           python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}"
 
-      - name: 📤 Upload Dubbed Output Artifact
-        uses: actions/upload-artifact@v4
+      - name: 🏷️ Publish Release (Direct CDN Download Link)
+        uses: softprops/action-gh-release@v2
         with:
-          name: dubbed-video-package
-          path: |
+          tag_name: run-${{ github.run_number }}-${{ github.run_id }}
+          name: Dubbed Video #${{ github.run_number }}
+          files: |
             final_output.mp4
             subtitles.srt
-          retention-days: 1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
