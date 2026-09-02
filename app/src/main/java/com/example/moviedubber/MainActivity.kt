@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -186,7 +187,7 @@ object DubberQueueManager {
                     detailedLogs = log
                     if (preview.isNotBlank()) firstLinePreview = preview
                 },
-                onComplete = { _, _ ->
+                onComplete = {
                     isProcessing = false
                     currentStatus = "🎉 Dub Finished! Link ready."
                     processNext(context)
@@ -272,7 +273,7 @@ fun DubberLiveApp() {
     var showSettings by remember { mutableStateOf(githubToken.isBlank()) }
 
     var fbUploadStage by remember { mutableStateOf("") }
-    var fbUploadPercent by remember { mutableIntStateOf(0) }
+    var fbUploadPercent by remember { mutableStateOf(0) }
     var isUploadingToFb by remember { mutableStateOf(false) }
 
     val pageAccounts = remember(fbPagesRaw) {
@@ -448,7 +449,7 @@ fun DubberLiveApp() {
                     Text(fbUploadStage, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     Spacer(modifier = Modifier.height(6.dp))
                     LinearProgressIndicator(
-                        progress = fbUploadPercent / 100f,
+                        progress = { fbUploadPercent / 100f },
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
@@ -489,7 +490,7 @@ fun DubberLiveApp() {
             Spacer(modifier = Modifier.height(8.dp))
 
             Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                DubberQueueManager.historyList.forEach { history ->
+                DubberQueueManager.historyList.forEachIndexed { index, history ->
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
@@ -634,6 +635,9 @@ fun DubberLiveApp() {
     }
 }
 
+// =========================================================================
+// 🚀 Cloud Pipeline Orchestrator & Workflow Log Monitor
+// =========================================================================
 suspend fun executeCloudDubbingPipeline(
     context: Context,
     owner: String,
@@ -744,7 +748,9 @@ suspend fun executeCloudDubbingPipeline(
                                     extractedPreview = m.group(1)?.trim() ?: ""
                                 }
                             }
-                        } catch (_: Exception) {}
+                        } catch (e: Exception) {
+                            // Non-blocking log preview extraction
+                        }
                     }
 
                     onStatusUpdate("⚙️ $activeStep", "Run ID: $runId", extractedPreview)
@@ -815,6 +821,9 @@ suspend fun executeCloudDubbingPipeline(
     }
 }
 
+// =========================================================================
+// 🎬 Facebook Reels Publisher (Live Socket Tracking & Captions Attachment)
+// =========================================================================
 suspend fun uploadUrlDirectlyToFacebook(
     context: Context,
     pageId: String,
@@ -913,7 +922,9 @@ suspend fun uploadUrlDirectlyToFacebook(
 
                     uploadClient.newCall(captionReq).execute().close()
                 }
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                // Non-blocking: Reel will still publish if subtitle upload fails
+            }
         }
 
         onProgress("Publishing Reel to Facebook...", 99)
