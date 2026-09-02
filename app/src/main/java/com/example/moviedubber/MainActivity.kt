@@ -15,8 +15,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -36,6 +34,7 @@ import okio.Buffer
 import okio.BufferedSink
 import okio.ForwardingSink
 import okio.buffer
+import okio.source
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -68,7 +67,6 @@ data class HistoryItem(
     var isUploaded: Boolean = false
 )
 
-// Socket Byte Streamer for Live Upload Percentage
 class ProgressRequestBody(
     private val file: File,
     private val contentType: MediaType,
@@ -90,9 +88,8 @@ class ProgressRequestBody(
             }
         }
         val bufferedCountingSink = countingSink.buffer()
-        val source = okio.Okio.source(file)
-        source.use {
-            bufferedCountingSink.writeAll(it)
+        file.source().use { source ->
+            bufferedCountingSink.writeAll(source)
             bufferedCountingSink.flush()
         }
     }
@@ -262,7 +259,6 @@ fun DubberLiveApp() {
     var githubRepo by remember { mutableStateOf(prefs.getString("repo", "Video-Dubbing-Pipeline") ?: "") }
     var githubToken by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
 
-    // Multi-Page Configuration (Stored format: Name|ID|Token lines)
     var fbPagesRaw by remember {
         mutableStateOf(prefs.getString("fb_pages_raw", "Main Page|100085938472910|EAA...") ?: "")
     }
@@ -280,7 +276,6 @@ fun DubberLiveApp() {
     var fbUploadPercent by remember { mutableStateOf(0) }
     var isUploadingToFb by remember { mutableStateOf(false) }
 
-    // Parse configured accounts
     val pageAccounts = remember(fbPagesRaw) {
         fbPagesRaw.lines().mapNotNull { line ->
             val parts = line.split("|")
@@ -373,7 +368,6 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Custom Title & Hashtag Boxes
         OutlinedTextField(
             value = customTitle,
             onValueChange = {
@@ -411,7 +405,6 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Language selection with English included for voiceover replacement
         Text("Target Dubbing Language", modifier = Modifier.align(Alignment.Start), fontSize = 13.sp)
         Spacer(modifier = Modifier.height(4.dp))
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -447,7 +440,6 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Uploading Progress Display
         if (isUploadingToFb) {
             Card(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -464,7 +456,6 @@ fun DubberLiveApp() {
             }
         }
 
-        // Live Process & First Line Preview Log
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(8.dp),
@@ -493,7 +484,6 @@ fun DubberLiveApp() {
             }
         }
 
-        // Previous 10 Downloads & Direct FB Publisher
         if (DubberQueueManager.historyList.isNotEmpty()) {
             Spacer(modifier = Modifier.height(14.dp))
             Text("🕒 Previous Download Links (Last 10)", fontWeight = FontWeight.Bold, fontSize = 15.sp, modifier = Modifier.align(Alignment.Start))
@@ -530,7 +520,6 @@ fun DubberLiveApp() {
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            // Page Selector Dropdown
                             var dropdownExpanded by remember { mutableStateOf(false) }
                             Box(modifier = Modifier.fillMaxWidth()) {
                                 OutlinedButton(
@@ -539,12 +528,11 @@ fun DubberLiveApp() {
                                     contentPadding = PaddingValues(horizontal = 8.dp)
                                 ) {
                                     Text(
-                                        "Target: ${selectedPageAccount?.name ?: "Select Page"}",
+                                        "Target: ${selectedPageAccount?.name ?: "Select Page"} ▼",
                                         fontSize = 11.sp,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
-                                    Icon(Icons.Default.ArrowDropDown, contentDescription = null)
                                 }
                                 DropdownMenu(
                                     expanded = dropdownExpanded,
@@ -588,7 +576,6 @@ fun DubberLiveApp() {
                                     Text("⬇️ Open", fontSize = 11.sp)
                                 }
 
-                                // Toggle Button state: "Upload to FB" vs "Re-upload to FB"
                                 Button(
                                     onClick = {
                                         val targetPage = selectedPageAccount
@@ -649,7 +636,7 @@ fun DubberLiveApp() {
 }
 
 // =========================================================================
-// 🚀 Cloud Pipeline Orchestrator & Workflow Response Poller
+// 🚀 Cloud Pipeline Orchestrator & Workflow Log Monitor
 // =========================================================================
 suspend fun executeCloudDubbingPipeline(
     context: Context,
@@ -695,7 +682,6 @@ suspend fun executeCloudDubbingPipeline(
         onStatusUpdate("⏳ Queued on GitHub...", "Waiting for cloud runner...", "")
         delay(6000)
 
-        // Poll Workflow Run ID
         var runId: Long? = null
         for (i in 1..12) {
             val runsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs?event=workflow_dispatch&per_page=1"
@@ -717,7 +703,6 @@ suspend fun executeCloudDubbingPipeline(
             return@withContext
         }
 
-        // Poll Progress and Scan Logs for TRANSLATION_PREVIEW
         var isDone = false
         var runConclusion = ""
         var extractedPreview = ""
@@ -749,7 +734,6 @@ suspend fun executeCloudDubbingPipeline(
                         }
                     }
 
-                    // Try fetching runner log snippet to grab 1st line translation
                     if (extractedPreview.isBlank() && jobId != 0L) {
                         try {
                             val logReq = Request.Builder()
@@ -765,7 +749,7 @@ suspend fun executeCloudDubbingPipeline(
                                 }
                             }
                         } catch (e: Exception) {
-                            // Non-fatal if runner log isn't readable yet
+                            // Non-blocking log preview extraction
                         }
                     }
 
@@ -784,7 +768,6 @@ suspend fun executeCloudDubbingPipeline(
             return@withContext
         }
 
-        // Retrieve Release Assets Direct CDN URLs (.mp4 and .srt)
         onStatusUpdate("🔗 Fetching Download Links...", "Querying release assets...", extractedPreview)
         delay(2000)
 
@@ -839,7 +822,7 @@ suspend fun executeCloudDubbingPipeline(
 }
 
 // =========================================================================
-// 🎬 Facebook Reels Publisher (With Live Socket Tracking & .srt Subtitle Upload)
+// 🎬 Facebook Reels Publisher (Live Socket Tracking & Captions Attachment)
 // =========================================================================
 suspend fun uploadUrlDirectlyToFacebook(
     context: Context,
@@ -864,7 +847,6 @@ suspend fun uploadUrlDirectlyToFacebook(
     try {
         onProgress("Initializing session on Meta...", 0)
 
-        // Step 1: Start Reel Session
         val initUrl = "https://graph.facebook.com/v20.0/$pageId/video_reels"
         val initPayload = JSONObject().apply {
             put("upload_phase", "start")
@@ -886,8 +868,7 @@ suspend fun uploadUrlDirectlyToFacebook(
             return@withContext
         }
 
-        // Step 2: Buffer MP4 asset
-        onProgress("Downloading clean MP4 from CDN...", 5)
+        onProgress("Buffering cloud MP4...", 5)
         val sourceReq = Request.Builder().url(videoUrl).build()
         val sourceRes = uploadClient.newCall(sourceReq).execute()
 
@@ -895,7 +876,6 @@ suspend fun uploadUrlDirectlyToFacebook(
             FileOutputStream(tempVideoFile).use { output -> input.copyTo(output) }
         }
 
-        // Step 3: Stream Video with Live Byte Tracking
         val countingBody = ProgressRequestBody(
             file = tempVideoFile,
             contentType = "application/octet-stream".toMediaType()
@@ -915,10 +895,9 @@ suspend fun uploadUrlDirectlyToFacebook(
 
         uploadClient.newCall(uploadReq).execute().close()
 
-        // Step 4: Attach .srt Captions (if present in release)
         if (srtUrl.isNotBlank()) {
             try {
-                onProgress("Attaching .srt subtitles to Reel...", 95)
+                onProgress("Attaching .srt captions...", 95)
                 val srtReq = Request.Builder().url(srtUrl).build()
                 val srtRes = uploadClient.newCall(srtReq).execute()
                 if (srtRes.isSuccessful && srtRes.body != null) {
@@ -944,11 +923,10 @@ suspend fun uploadUrlDirectlyToFacebook(
                     uploadClient.newCall(captionReq).execute().close()
                 }
             } catch (e: Exception) {
-                // Non-blocking: publish Reel even if captions API rejected formatting
+                // Non-blocking: Reel will still publish if subtitle upload fails
             }
         }
 
-        // Step 5: Publish Reel with Custom Title & Tags
         onProgress("Publishing Reel to Facebook...", 99)
         val publishUrl = "https://graph.facebook.com/v20.0/$pageId/video_reels"
         val pubPayload = JSONObject().apply {
