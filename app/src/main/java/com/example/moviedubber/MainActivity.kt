@@ -9,8 +9,8 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -185,9 +185,12 @@ object DubberQueueManager {
                 onStatusUpdate = { status, log, preview ->
                     currentStatus = status
                     detailedLogs = log
-                    if (preview.isNotBlank()) firstLinePreview = preview
+                    if (preview.isNotBlank()) {
+                        val words = preview.trim().split(Regex("\\s+"))
+                        firstLinePreview = if (words.size > 5) words.take(5).joinToString(" ") + "..." else preview
+                    }
                 },
-                onComplete = {
+                onComplete = { _, _ ->
                     isProcessing = false
                     currentStatus = "🎉 Dub Finished! Link ready."
                     processNext(context)
@@ -273,7 +276,7 @@ fun DubberLiveApp() {
     var showSettings by remember { mutableStateOf(githubToken.isBlank()) }
 
     var fbUploadStage by remember { mutableStateOf("") }
-    var fbUploadPercent by remember { mutableStateOf(0) }
+    var fbUploadPercent by remember { mutableIntStateOf(0) }
     var isUploadingToFb by remember { mutableStateOf(false) }
 
     val pageAccounts = remember(fbPagesRaw) {
@@ -405,17 +408,32 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(8.dp))
 
+        // Horizontally scrollable language chips
         Text("Target Dubbing Language", modifier = Modifier.align(Alignment.Start), fontSize = 13.sp)
         Spacer(modifier = Modifier.height(4.dp))
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            listOf("hi" to "Hindi", "en" to "English (Re-voice)", "es" to "Spanish", "fr" to "French", "de" to "German").forEach { (code, name) ->
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            listOf(
+                "hi" to "Hindi",
+                "en" to "English (Re-vocal)",
+                "es" to "Spanish",
+                "fr" to "French",
+                "de" to "German",
+                "it" to "Italian",
+                "pt" to "Portuguese",
+                "ja" to "Japanese"
+            ).forEach { (code, name) ->
                 FilterChip(
                     selected = selectedLanguage == code,
                     onClick = {
                         selectedLanguage = code
                         prefs.edit().putString("default_lang", code).apply()
                     },
-                    label = { Text(name, fontSize = 11.sp) }
+                    label = { Text(name, fontSize = 12.sp, maxLines = 1) }
                 )
             }
         }
@@ -449,7 +467,7 @@ fun DubberLiveApp() {
                     Text(fbUploadStage, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     Spacer(modifier = Modifier.height(6.dp))
                     LinearProgressIndicator(
-                        progress = { fbUploadPercent / 100f },
+                        progress = fbUploadPercent / 100f,
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
@@ -466,7 +484,7 @@ fun DubberLiveApp() {
                 if (DubberQueueManager.firstLinePreview.isNotBlank()) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        "🗣️ 1st Translated Line: \"${DubberQueueManager.firstLinePreview}\"",
+                        "🗣️ 1st Line (5 words): \"${DubberQueueManager.firstLinePreview}\"",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF00796B)
@@ -552,30 +570,57 @@ fun DubberLiveApp() {
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            // Action Buttons Row: Watch | Copy | Open | Upload
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                // 1. Direct Stream Video Player
+                                Button(
+                                    onClick = {
+                                        try {
+                                            val streamIntent = Intent(Intent.ACTION_VIEW).apply {
+                                                setDataAndType(Uri.parse(history.downloadUrl), "video/*")
+                                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            }
+                                            context.startActivity(Intent.createChooser(streamIntent, "Stream Video"))
+                                        } catch (e: Exception) {
+                                            Toast.makeText(context, "No video player installed", Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    modifier = Modifier.weight(1f).height(36.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                                    contentPadding = PaddingValues(horizontal = 2.dp)
+                                ) {
+                                    Text("▶ Watch", fontSize = 11.sp, color = Color.White)
+                                }
+
+                                // 2. Copy Link
                                 OutlinedButton(
                                     onClick = {
                                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                         clipboard.setPrimaryClip(ClipData.newPlainText("Dubbed Link", history.downloadUrl))
                                         Toast.makeText(context, "📋 Link copied!", Toast.LENGTH_SHORT).show()
                                     },
-                                    modifier = Modifier.weight(1f).height(36.dp),
-                                    contentPadding = PaddingValues(horizontal = 4.dp)
+                                    modifier = Modifier.weight(0.9f).height(36.dp),
+                                    contentPadding = PaddingValues(horizontal = 2.dp)
                                 ) {
                                     Text("📋 Copy", fontSize = 11.sp)
                                 }
 
-                                Button(
+                                // 3. Open in Browser
+                                OutlinedButton(
                                     onClick = {
                                         val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(history.downloadUrl))
                                         context.startActivity(browserIntent)
                                     },
-                                    modifier = Modifier.weight(1f).height(36.dp),
-                                    contentPadding = PaddingValues(horizontal = 4.dp)
+                                    modifier = Modifier.weight(0.9f).height(36.dp),
+                                    contentPadding = PaddingValues(horizontal = 2.dp)
                                 ) {
                                     Text("⬇️ Open", fontSize = 11.sp)
                                 }
 
+                                // 4. Direct Upload FB with Dynamic Re-upload State
                                 Button(
                                     onClick = {
                                         val targetPage = selectedPageAccount
@@ -618,11 +663,11 @@ fun DubberLiveApp() {
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = if (history.isUploaded) Color(0xFFE65100) else Color(0xFF1877F2)
                                     ),
-                                    contentPadding = PaddingValues(horizontal = 4.dp)
+                                    contentPadding = PaddingValues(horizontal = 2.dp)
                                 ) {
                                     Text(
                                         if (history.isUploaded) "🔄 Re-upload" else "🚀 Upload FB",
-                                        fontSize = 11.sp,
+                                        fontSize = 10.sp,
                                         color = Color.White
                                     )
                                 }
@@ -635,9 +680,6 @@ fun DubberLiveApp() {
     }
 }
 
-// =========================================================================
-// 🚀 Cloud Pipeline Orchestrator & Workflow Log Monitor
-// =========================================================================
 suspend fun executeCloudDubbingPipeline(
     context: Context,
     owner: String,
@@ -748,9 +790,7 @@ suspend fun executeCloudDubbingPipeline(
                                     extractedPreview = m.group(1)?.trim() ?: ""
                                 }
                             }
-                        } catch (e: Exception) {
-                            // Non-blocking log preview extraction
-                        }
+                        } catch (_: Exception) {}
                     }
 
                     onStatusUpdate("⚙️ $activeStep", "Run ID: $runId", extractedPreview)
@@ -821,9 +861,6 @@ suspend fun executeCloudDubbingPipeline(
     }
 }
 
-// =========================================================================
-// 🎬 Facebook Reels Publisher (Live Socket Tracking & Captions Attachment)
-// =========================================================================
 suspend fun uploadUrlDirectlyToFacebook(
     context: Context,
     pageId: String,
@@ -922,9 +959,7 @@ suspend fun uploadUrlDirectlyToFacebook(
 
                     uploadClient.newCall(captionReq).execute().close()
                 }
-            } catch (e: Exception) {
-                // Non-blocking: Reel will still publish if subtitle upload fails
-            }
+            } catch (_: Exception) {}
         }
 
         onProgress("Publishing Reel to Facebook...", 99)
