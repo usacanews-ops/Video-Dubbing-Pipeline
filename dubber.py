@@ -14,13 +14,14 @@ import edge_tts
 from pydub import AudioSegment
 
 # ==========================================
-# 1. 📥 Download Media & Extract Source Info
+# 1. 📥 Download Media & Sanitize Corruptions
 # ==========================================
 def download_media(url: str) -> tuple[str, str, dict]:
+    dl_path = "downloaded.mp4"
     video_path = "raw_source.mp4"
     audio_path = "input_audio.wav"
 
-    for path in [video_path, audio_path]:
+    for path in [dl_path, video_path, audio_path]:
         if os.path.exists(path):
             try:
                 os.remove(path)
@@ -29,7 +30,7 @@ def download_media(url: str) -> tuple[str, str, dict]:
 
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': video_path,
+        'outtmpl': dl_path,
         'quiet': True,
         'no_warnings': True,
     }
@@ -48,9 +49,27 @@ def download_media(url: str) -> tuple[str, str, dict]:
 
     print(f"TITLE_EMIT: {meta_dict['title']}")
 
-    # Extract 16kHz Mono Audio for transcription
+    # 🛡️ BULLETPROOFING: Sanitize file to permanently fix AAC scalefactor/bitstream errors
+    print("🧹 Sanitizing stream (Discarding corrupted AAC/Video frames)...")
     subprocess.run([
-        'ffmpeg', '-y', '-i', video_path,
+        'ffmpeg', '-y',
+        '-err_detect', 'ignore_err',
+        '-i', dl_path,
+        '-c:v', 'copy',                # Copy video stream directly (fast)
+        '-c:a', 'aac', '-b:a', '192k', # Re-encode audio to a pristine, continuous track
+        '-ar', '44100',
+        video_path
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+    # Clean up the raw corrupted download
+    if os.path.exists(dl_path):
+        os.remove(dl_path)
+
+    print("🎵 Extracting raw 16kHz PCM audio for AI processing...")
+    subprocess.run([
+        'ffmpeg', '-y',
+        '-err_detect', 'ignore_err',
+        '-i', video_path,
         '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
         audio_path
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -83,7 +102,6 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
     if source_lang == target_lang:
         return clean_text
 
-    # Attempt 1: Google Translator with Retry & Backoff
     for _ in range(2):
         try:
             res = GoogleTranslator(source='auto', target=target_lang).translate(clean_text)
@@ -93,7 +111,6 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
         except Exception:
             time.sleep(0.4)
 
-    # Attempt 2: MyMemory Translator Fallback
     try:
         s_lang = source_lang if source_lang and source_lang != 'auto' else 'en'
         res = MyMemoryTranslator(source=s_lang, target=target_lang).translate(clean_text)
@@ -101,19 +118,6 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
             return res.strip()
     except Exception:
         pass
-
-    # Attempt 3: Sentence splitting
-    words = clean_text.split()
-    if len(words) > 3:
-        try:
-            half = len(words) // 2
-            p1 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[:half]))
-            p2 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[half:]))
-            combined = f"{p1} {p2}".strip()
-            if not is_invalid_output(combined):
-                return combined
-        except Exception:
-            pass
 
     return clean_text
 
@@ -131,7 +135,6 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     if not raw_list:
         return []
 
-    # Merge tight pauses (< 0.2s)
     merged = [raw_list[0]]
     for s in raw_list[1:]:
         prev = merged[-1]
@@ -203,7 +206,7 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             seg["tts_dur"] = orig_dur
 
 # ==========================================
-# 4. ❄️ Native Frame-Freeze Video Assembly
+# 4. ❄️ Error-Proof Native Frame-Freeze Assembly
 # ==========================================
 def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], output_file: str):
     total_src_duration = get_duration(video_path)
@@ -219,14 +222,13 @@ def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], outpu
         s_start = max(current_src_pos, seg["orig_start"])
         s_end = min(total_src_duration, seg["orig_end"])
 
-        # 1. Play intervening gap (if any silence between previous dialogue and current)
+        # 1. Play intervening gap (with ignore_err injected)
         if s_start > current_src_pos + 0.05:
             gap_dur = s_start - current_src_pos
             gap_file = f"chunks/gap_{i}.mp4"
             cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-ss', f"{current_src_pos:.3f}",
+                'ffmpeg', '-y', '-err_detect', 'ignore_err',
+                '-ss', f"{current_src_pos:.3f}", '-i', video_path,
                 '-t', f"{gap_dur:.3f}",
                 '-f', 'lavfi', '-t', f"{gap_dur:.3f}", '-i', 'anullsrc=r=44100:cl=stereo',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
@@ -248,11 +250,9 @@ def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], outpu
         dial_file = f"chunks/dial_{i}.mp4"
 
         if freeze_dur < 0.15:
-            # TTS fits inside slot: standard sync without freeze
             cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-ss', f"{s_start:.3f}",
+                'ffmpeg', '-y', '-err_detect', 'ignore_err',
+                '-ss', f"{s_start:.3f}", '-i', video_path,
                 '-t', f"{dial_dur:.3f}",
                 '-i', seg["audio_file"],
                 '-map', '0:v:0', '-map', '1:a:0',
@@ -262,12 +262,10 @@ def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], outpu
                 dial_file
             ]
         else:
-            # TTS is longer: freeze the last video frame using tpad filter
             total_clip_dur = dial_dur + freeze_dur
             cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-ss', f"{s_start:.3f}",
+                'ffmpeg', '-y', '-err_detect', 'ignore_err',
+                '-ss', f"{s_start:.3f}", '-i', video_path,
                 '-t', f"{dial_dur:.3f}",
                 '-i', seg["audio_file"],
                 '-filter_complex', f'[0:v]tpad=stop_mode=clone:stop_duration={freeze_dur:.3f}[v]',
@@ -282,14 +280,13 @@ def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], outpu
         concat_list.append(dial_file)
         current_src_pos = s_end
 
-    # 3. Tail slice (remaining video after final dialogue)
+    # 3. Tail slice
     if current_src_pos < total_src_duration:
         tail_dur = total_src_duration - current_src_pos
         tail_file = "chunks/tail.mp4"
         cmd = [
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-ss', f"{current_src_pos:.3f}",
+            'ffmpeg', '-y', '-err_detect', 'ignore_err',
+            '-ss', f"{current_src_pos:.3f}", '-i', video_path,
             '-t', f"{tail_dur:.3f}",
             '-f', 'lavfi', '-t', f"{tail_dur:.3f}", '-i', 'anullsrc=r=44100:cl=stereo',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
@@ -308,6 +305,7 @@ def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], outpu
     print("🛡️ Merging slices, stripping metadata, and encoding final reel...")
     subprocess.run([
         'ffmpeg', '-y',
+        '-err_detect', 'ignore_err',
         '-f', 'concat', '-safe', '0', '-i', concat_txt,
         '-map_metadata', '-1', '-map_chapters', '-1',
         '-fflags', '+bitexact', '-flags:v', '+bitexact', '-flags:a', '+bitexact',
