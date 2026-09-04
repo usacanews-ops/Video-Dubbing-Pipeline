@@ -1,4 +1,3 @@
-```python
 import os,sys,subprocess,asyncio,time,re,json,shutil
 import yt_dlp
 from faster_whisper import WhisperModel
@@ -867,4 +866,3 @@ if __name__=="__main__":
         print(f"Error: {e}")
         print("="*55)
         raise
-```
