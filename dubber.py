@@ -53,6 +53,14 @@ def invalid_translation(text):
     bads = ("<html", "<!doctype", "captcha", "access denied", "server error", "unusual traffic", "invalid language", "languages are supported", "is an invalid language", "traceback", "exception")
     return any(b in v for b in bads)
 
+def clean_social_title(title):
+    t = clean_text(title)
+    # Strip patterns like '83K views · 876 reactions | '
+    t = re.sub(r"^[\d.,KMkm]+\s*views\s*·\s*[\d.,KMkm]+\s*reactions\s*\|\s*", "", t, flags=re.IGNORECASE)
+    # Strip alternate separators or partial badges if present
+    t = re.sub(r"^[\d.,KMkm]+\s*views\s*\|\s*", "", t, flags=re.IGNORECASE)
+    return t.strip()
+
 def download_media(url):
     video_path, audio_path = "raw_source.mp4", "input_audio.wav"
     for p in (video_path, audio_path):
@@ -63,7 +71,9 @@ def download_media(url):
     opts = {"format": "best[ext=mp4]/best", "outtmpl": video_path, "merge_output_format": "mp4", "noplaylist": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-    meta = {"title": info.get("title", "Dubbed Video"), "description": info.get("description", ""), "tags": info.get("tags", [])}
+    raw_title = info.get("title", "Dubbed Video")
+    cleaned_title = clean_social_title(raw_title)
+    meta = {"title": cleaned_title, "description": info.get("description", ""), "tags": info.get("tags", [])}
     with open("source_meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print("TITLE_EMIT: " + meta["title"])
@@ -395,4 +405,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
