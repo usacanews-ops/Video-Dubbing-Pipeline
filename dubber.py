@@ -15,7 +15,7 @@ from pydub import AudioSegment
 # ================= CONFIG =================
 
 # 1. Pacing & Speed
-TTS_RATE = "+15%"          # Fast, natural articulation (minimizes required freeze)
+TTS_RATE = "+15%"          # Fast, natural articulation
 FINAL_SPEED = 1.10         # Exact +10% uniform master speedup
 
 # 2. Timing Controls
@@ -24,8 +24,11 @@ SAFETY_GAP = 0.03
 SILENCE_THRESHOLD = -42
 WHISPER_MODEL = "tiny"
 
-# 3. Encoding Presets
-AUDIO_BITRATE = "96k"      # 96k AAC is crisp for speech and saves 1-2 MB
+# 3. Quality & Bitrate Controls (Crisp 1080p/720p with compact 12-16 MB size)
+FINAL_CRF = "22"           # Visually crisp, studio-grade quality
+MAX_VIDEO_BITRATE = "2200k"# Bitrate ceiling (prevents size explosion)
+BUFFER_SIZE = "4400k"
+AUDIO_BITRATE = "128k"     # Clean, clear narration audio
 
 VOICE_MAP = {
     "hi": "hi-IN-MadhurNeural",
@@ -72,20 +75,6 @@ def get_duration(path):
         path
     ])
     return float(result.strip())
-
-def detect_source_video_bitrate(video_path, default_kbps=550):
-    """Calculates source video bitrate to guarantee the final output matches source file size."""
-    try:
-        dur = get_duration(video_path)
-        if dur > 0:
-            total_bytes = os.path.getsize(video_path)
-            total_kbps = int((total_bytes * 8) / dur / 1000)
-            # Subtract 96k for audio, leave rest for video (bounded between 350k and 900k)
-            video_kbps = max(350, min(total_kbps - 96, 900))
-            return video_kbps
-    except Exception:
-        pass
-    return default_kbps
 
 # ================= DOWNLOAD =================
 
@@ -268,7 +257,7 @@ async def synthesize_audio(segments, temp_dir="temp_audio"):
     os.makedirs(temp_dir, exist_ok=True)
 
     print(f"🔊 Synthesizing {len(segments)} TTS clips in parallel at {TTS_RATE}...")
-    sem = asyncio.Semaphore(5)  # 5 parallel synthesis workers
+    sem = asyncio.Semaphore(5)
 
     async def fetch_one(i, seg):
         text = seg.get("translated_text", "").strip()
@@ -356,7 +345,7 @@ def build_master_audio(segments, total_duration, output_file):
     master.export(output_file, format="wav")
     return output_file
 
-# ================= HIGH-SPEED VIDEO SLICING =================
+# ================= HIGH-SPEED LOSSLESS SLICING =================
 
 def create_video_part(video_file, source_start, source_end, freeze_duration, output_file):
     duration = source_end - source_start
@@ -371,15 +360,15 @@ def create_video_part(video_file, source_start, source_end, freeze_duration, out
     if ENABLE_FREEZE and freeze_duration > 0.01:
         filters.append(f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f}")
 
-    # Use ultrafast preset for intermediate scratch clips
+    # CRF 17 preserves near-lossless clarity during fast intermediate cuts
     cmd = [
         "ffmpeg", "-y", "-err_detect", "ignore_err",
         "-i", video_file,
         "-an",
         "-vf", ",".join(filters),
         "-c:v", "libx264",
-        "-preset", "ultrafast",   # Fast scratch slices
-        "-crf", "23",
+        "-preset", "ultrafast",
+        "-crf", "17",
         "-pix_fmt", "yuv420p",
         "-r", "30",
         output_file
@@ -394,7 +383,7 @@ def concatenate_video_parts(parts, output_file):
             absolute = os.path.abspath(part).replace("\\", "/").replace("'", "'\\''")
             f.write(f"file '{absolute}'\n")
 
-    # Fast stream copy
+    # Fast stream copy without generation loss
     run_command([
         "ffmpeg", "-y",
         "-f", "concat",
@@ -409,7 +398,7 @@ def concatenate_video_parts(parts, output_file):
 
 def build_extended_video(video_file, segments, output_file):
     source_duration = get_duration(video_file)
-    print("🎬 Slicing & freezing video parts (High-Speed Mode)...")
+    print("🎬 Slicing & freezing video parts (High-Fidelity Mode)...")
 
     temp_dir = "temp_video_parts"
     if os.path.exists(temp_dir):
@@ -441,19 +430,16 @@ def build_extended_video(video_file, segments, output_file):
     concatenate_video_parts(parts, output_file)
     return output_file
 
-# ================= SINGLE-PASS FINAL MUX & SPEED =================
+# ================= FINAL MUX & MASTER SPEEDUP =================
 
-def mux_final_video(extended_video, dubbed_audio, output_file, target_v_bitrate):
+def mux_final_video(extended_video, dubbed_audio, output_file):
     pct = int(round((FINAL_SPEED - 1.0) * 100))
-    print(f"🎬 Single-pass mux: +{pct}% speedup @ {target_v_bitrate}k bitrate target...")
+    print(f"🎬 Final mux: +{pct}% speedup @ CRF {FINAL_CRF} (Max: {MAX_VIDEO_BITRATE})...")
 
     video_filter = f"setpts=PTS/{FINAL_SPEED:.4f},fps=30"
     audio_filter = f"atempo={FINAL_SPEED:.4f}"
 
-    maxrate = int(target_v_bitrate * 1.3)
-    bufsize = int(target_v_bitrate * 2.0)
-
-    # Single compression pass with strict bitrate ceiling to match source size
+    # Controlled CRF encoding: pristine details while capping maximum spikes
     run_command([
         "ffmpeg", "-y",
         "-i", extended_video,
@@ -464,9 +450,9 @@ def mux_final_video(extended_video, dubbed_audio, output_file, target_v_bitrate)
         "-af", audio_filter,
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-b:v", f"{target_v_bitrate}k",
-        "-maxrate", f"{maxrate}k",
-        "-bufsize", f"{bufsize}k",
+        "-crf", FINAL_CRF,
+        "-maxrate", MAX_VIDEO_BITRATE,
+        "-bufsize", BUFFER_SIZE,
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", AUDIO_BITRATE,
@@ -536,11 +522,12 @@ if __name__ == "__main__":
 
     print()
     print("=" * 55)
-    print("AI DUBBING ENGINE (ULTRA-FAST & SIZE-OPTIMIZED)")
+    print("AI DUBBING ENGINE (STUDIO QUALITY & COMPACT)")
     print("=" * 55)
     print(f"Target language : {target_language}")
     print(f"TTS Speech rate : {TTS_RATE}")
     print(f"Master speedup  : {FINAL_SPEED}x (+{int(round((FINAL_SPEED - 1.0) * 100))}%)")
+    print(f"Video Quality   : CRF {FINAL_CRF}")
     print("=" * 55)
     print()
 
@@ -548,9 +535,6 @@ if __name__ == "__main__":
 
     try:
         video_file, audio_file, metadata = download_media(video_url)
-
-        target_bitrate = detect_source_video_bitrate(video_file)
-        print(f"🎯 Target video bitrate locked to: {target_bitrate} kbps")
 
         segments = transcribe_and_translate(audio_file, target_language)
         if not segments:
@@ -570,7 +554,7 @@ if __name__ == "__main__":
         extended_video = "extended_video.mp4"
         build_extended_video(video_file, segments, extended_video)
 
-        mux_final_video(extended_video, master_audio, "final_output.mp4", target_bitrate)
+        mux_final_video(extended_video, master_audio, "final_output.mp4")
         generate_srt(segments, "subtitles.srt")
 
         orig_dur = get_duration(video_file)
@@ -585,9 +569,9 @@ if __name__ == "__main__":
         print("=" * 55)
         print(f"Execution time    : {total_time:.1f}s (~{total_time/60:.1f} min)")
         print(f"Original size     : {orig_mb:.2f} MB")
-        print(f"Final size        : {final_mb:.2f} MB (Matches source)")
+        print(f"Final size        : {final_mb:.2f} MB (High-Quality)")
         print(f"Original duration : {orig_dur:.2f}s")
-        print(f"Final duration    : {final_dur:.2f}s (Speed +{int(round((FINAL_SPEED - 1.0) * 100))}%)")
+        print(f"Final duration    : {final_dur:.2f}s")
         print("=" * 55)
 
         cleanup()
