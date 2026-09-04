@@ -4,17 +4,18 @@ import subprocess
 import asyncio
 import time
 import re
+import json
 import yt_dlp
 from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator, MyMemoryTranslator, LingueeTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 import edge_tts
 from pydub import AudioSegment
 
 # ==========================================
-# 1. 📥 Download Media & Strip Input Stream
+# 1. 📥 Download Media & Extract Source Info
 # ==========================================
-def download_media(url: str) -> tuple[str, str]:
-    video_path = "input_video.mp4"
+def download_media(url: str) -> tuple[str, str, dict]:
+    video_path = "raw_source.mp4"
     audio_path = "input_audio.wav"
 
     for path in [video_path, audio_path]:
@@ -27,29 +28,40 @@ def download_media(url: str) -> tuple[str, str]:
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': video_path,
-        'quiet': False,
+        'quiet': True,
         'no_warnings': True,
     }
 
-    print("📥 Downloading video stream...")
+    print("📥 Fetching source stream and metadata...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+        meta = ydl.extract_info(url, download=True)
+        meta_dict = {
+            "title": meta.get("title", "Dubbed Video"),
+            "description": meta.get("description", ""),
+            "tags": meta.get("tags", [])
+        }
 
-    print("🎵 Extracting raw 16kHz PCM audio for AI processing...")
+    # Save metadata JSON for the cloud artifact release
+    with open("source_meta.json", "w", encoding="utf-8") as mf:
+        json.dump(meta_dict, mf, ensure_ascii=False)
+
+    print(f"TITLE_EMIT: {meta_dict['title']}")
+
+    # Extract 16kHz Mono Audio for transcription
     subprocess.run([
         'ffmpeg', '-y', '-i', video_path,
         '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
         audio_path
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-    return video_path, audio_path
+    return video_path, audio_path, meta_dict
 
 def get_duration(file_path: str) -> float:
     cmd = f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 \"{file_path}\""
     return float(subprocess.check_output(cmd, shell=True).strip())
 
 # ==========================================
-# 2. 🎙️ Transcription, Detection & Forced Translation
+# 2. 🎙️ Auto-Detection & Forced Translation
 # ==========================================
 def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> str:
     clean_text = re.sub(r'[\r\n\t]+', ' ', text).strip()
@@ -59,81 +71,59 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
     if source_lang == target_lang:
         return clean_text
 
-    # Attempt 1: Google Translator
+    # Attempt 1: Google Translate
     try:
         res = GoogleTranslator(source='auto', target=target_lang).translate(clean_text)
         if res and res.strip().lower() != clean_text.lower():
             return res.strip()
-    except Exception as e:
-        print(f"⚠️ Google Translate failed: {e}")
+    except Exception:
+        pass
 
-    # Attempt 2: MyMemory Translator
+    # Attempt 2: MyMemory Translate
     try:
         res = MyMemoryTranslator(source=source_lang if source_lang != 'auto' else 'en', target=target_lang).translate(clean_text)
         if res and res.strip().lower() != clean_text.lower():
             return res.strip()
-    except Exception as e:
-        print(f"⚠️ MyMemory Translate failed: {e}")
+    except Exception:
+        pass
 
-    # Attempt 3: Sentence decomposition
-    words = clean_text.split()
-    if len(words) > 3:
-        try:
-            half = len(words) // 2
-            part1 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[:half]))
-            part2 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[half:]))
-            combined = f"{part1} {part2}".strip()
-            if combined and combined.lower() != clean_text.lower():
-                return combined
-        except Exception:
-            pass
-
-    print(f"⚠️ Warning: Retaining original string for: '{clean_text[:30]}'")
     return clean_text
 
 def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[dict]:
-    print("🎙️ Transcribing and auto-detecting spoken language...")
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    
-    # language=None enables Whisper's native auto-detection
     raw_segments, info = model.transcribe(audio_path, language=None, vad_filter=True)
     detected_lang = info.language
-    print(f"🌍 Detected source language: {detected_lang} (Probability: {info.language_probability:.2f})")
 
     raw_list = []
     for s in raw_segments:
-        text = s.text.strip()
-        if text and (s.end - s.start >= 0.25):
-            raw_list.append({"start": s.start, "end": s.end, "text": text})
+        t = s.text.strip()
+        if t and (s.end - s.start >= 0.25):
+            raw_list.append({"start": s.start, "end": s.end, "text": t})
 
     if not raw_list:
-        print("⚠️ No dialogue detected in video.")
         return []
 
-    # Merge adjacent segments (< 0.5s pause) for smoother sentence synthesis
+    # Merge tight adjacent segments
     merged = [raw_list[0]]
     for s in raw_list[1:]:
         prev = merged[-1]
-        if s["start"] - prev["end"] < 0.5:
+        if s["start"] - prev["end"] < 0.4:
             prev["end"] = max(prev["end"], s["end"])
             prev["text"] += " " + s["text"]
         else:
             merged.append(s)
 
     segments = []
-    print(f"🌐 Translating {len(merged)} dialogues ({detected_lang} -> {target_lang})...")
     first_preview_printed = False
 
-    for i, s in enumerate(merged, start=1):
+    for s in merged:
         translated = translate_text_enforced(s["text"], detected_lang, target_lang)
 
-        # Emit Preview Tag for Android App Log Interceptor
         if not first_preview_printed and translated:
-            print(f"TRANSLATION_PREVIEW: {translated}")
+            words = translated.strip().split()
+            short_preview = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
+            print(f"TRANSLATION_PREVIEW: {short_preview}")
             first_preview_printed = True
-
-        print(f"[{i}/{len(merged)}] SRC: {s['text']}")
-        print(f"       -> TARGET: {translated}")
 
         segments.append({
             "orig_start": s["start"],
@@ -145,18 +135,15 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     return segments
 
 # ==========================================
-# 3. 🗣️ Speech Synthesis & Voice Replacement
+# 3. 🗣️ Speech Synthesis (+18% Snappy Rate)
 # ==========================================
 async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
     os.makedirs(temp_dir, exist_ok=True)
-    print("🗣️ Generating new AI narration voiceover...")
-
     for i, seg in enumerate(segments):
         audio_file = os.path.join(temp_dir, f"audio_{i}.mp3")
         text = seg["translated_text"].strip()
         lang = seg.get("target_lang", "hi")
 
-        # Select natural Neural voices depending on chosen language
         voice = "hi-IN-MadhurNeural"
         if lang == "en":
             voice = "en-US-GuyNeural"
@@ -168,73 +155,59 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             voice = "de-DE-ConradNeural"
 
         clean_tts_text = re.sub(r'[\[\]\(\)\{\}\<\>\"\'\*\#\@]', '', text).strip()
-
-        if not clean_tts_text or len(clean_tts_text) < 2:
-            silent = AudioSegment.silent(duration=500)
+        if not clean_tts_text:
+            silent = AudioSegment.silent(duration=400)
             silent.export(audio_file, format="mp3")
             seg["audio_file"] = audio_file
-            seg["tts_dur"] = 0.5
+            seg["tts_dur"] = 0.4
             continue
 
         seg["audio_file"] = audio_file
-        success = False
-
-        for attempt in range(3):
-            try:
-                rate = "+15%" if lang != "en" else "+5%"
-                communicate = edge_tts.Communicate(clean_tts_text, voice, rate=rate)
-                await communicate.save(audio_file)
-                if os.path.exists(audio_file) and os.path.getsize(audio_file) > 100:
-                    seg["tts_dur"] = get_duration(audio_file)
-                    success = True
-                    break
-            except Exception as e:
-                print(f"⚠️ TTS retry {attempt + 1}: {e}")
-                await asyncio.sleep(1.0)
-
-        if not success:
-            fallback_dur = max(0.5, seg["orig_end"] - seg["orig_start"])
-            silent = AudioSegment.silent(duration=int(fallback_dur * 1000))
+        # Faster rate (+18%) keeps video energetic and crisp
+        try:
+            communicate = edge_tts.Communicate(clean_tts_text, voice, rate="+18%")
+            await communicate.save(audio_file)
+            seg["tts_dur"] = get_duration(audio_file)
+        except Exception:
+            dur = max(0.4, seg["orig_end"] - seg["orig_start"])
+            silent = AudioSegment.silent(duration=int(dur * 1000))
             silent.export(audio_file, format="mp3")
-            seg["tts_dur"] = fallback_dur
+            seg["tts_dur"] = dur
 
 # ==========================================
-# 4. 🎬 Video Assembly & Total Metadata Stripping
+# 4. 🎬 +12% Video Speed Up & Total Scrub
 # ==========================================
 def render_dubbed_video(video_path: str, segments: list[dict], output_file: str):
-    print("🎬 Stitching clean master audio track...")
     orig_total_dur = get_duration(video_path)
 
-    # Prevent speech collisions by enforcing non-overlapping timestamps
+    # Calculate tight timeline with minimal inter-speech gaps
     timeline_cursor = 0.0
     for seg in segments:
         start_time = max(seg["orig_start"], timeline_cursor)
         seg["new_start"] = start_time
         seg["new_end"] = start_time + seg["tts_dur"]
-        timeline_cursor = seg["new_end"] + 0.15
+        timeline_cursor = seg["new_end"] + 0.1
 
     final_audio_dur = max(orig_total_dur, timeline_cursor)
-
     master_audio = AudioSegment.silent(duration=int((final_audio_dur + 1.5) * 1000))
+
     for seg in segments:
         clip = AudioSegment.from_file(seg["audio_file"])
-        pos_ms = int(seg["new_start"] * 1000)
-        master_audio = master_audio.overlay(clip, position=pos_ms)
+        master_audio = master_audio.overlay(clip, position=int(seg["new_start"] * 1000))
 
-    master_audio_path = "master_output_audio.wav"
+    master_audio_path = "temp_master_audio.wav"
     master_audio.export(master_audio_path, format="wav")
 
-    stretch_factor = final_audio_dur / orig_total_dur if orig_total_dur > 0 else 1.0
-
-    print("🛡️ Rendering MP4 & Purging 100% metadata/EXIF/signatures...")
+    # Overall Video Speed increase: 1.12x (12% faster video and audio)
+    # setpts=PTS/1.12 increases video speed; atempo=1.12 increases audio speed
+    speed_factor = 1.12
     cmd = [
         'ffmpeg', '-y',
         '-i', video_path,
         '-i', master_audio_path,
-        '-filter_complex', f'[0:v]setpts={stretch_factor:.5f}*PTS,fps=30[vout]',
-        '-map', '[vout]',
-        '-map', '1:a',
-        # Complete metadata and vendor stripping
+        '-filter_complex', f'[0:v]setpts=PTS/{speed_factor},fps=30[v];[1:a]atempo={speed_factor}[a]',
+        '-map', '[v]',
+        '-map', '[a]',
         '-map_metadata', '-1',
         '-map_chapters', '-1',
         '-fflags', '+bitexact',
@@ -242,10 +215,7 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
         '-flags:a', '+bitexact',
         '-c:v', 'libx264',
         '-preset', 'veryfast',
-        '-b:v', '2600k',
-        '-maxrate', '3200k',
-        '-bufsize', '6400k',
-        '-pix_fmt', 'yuv420p',
+        '-b:v', '2500k',
         '-c:a', 'aac',
         '-b:a', '192k',
         '-shortest',
@@ -254,9 +224,11 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
     subprocess.run(cmd, check=True)
 
 # ==========================================
-# 5. 📝 Synchronized Subtitle (.srt) Generation
+# 5. 📝 Subtitle (.srt) Generation
 # ==========================================
 def format_timestamp(seconds: float) -> str:
+    # Scale timestamps down by 1.12 to match sped-up video
+    seconds = seconds / 1.12
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
@@ -264,24 +236,19 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def generate_srt(segments: list[dict], output_file: str = "subtitles.srt"):
-    print("📝 Generating synchronized SRT captions...")
     with open(output_file, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, start=1):
             start_str = format_timestamp(seg["new_start"])
             end_str = format_timestamp(seg["new_end"])
             f.write(f"{i}\n{start_str} --> {end_str}\n{seg['translated_text']}\n\n")
 
-# ==========================================
-# 🚀 Entrypoint
-# ==========================================
 if __name__ == "__main__":
-    url = sys.argv[1]
-    target_lang = sys.argv[2] if len(sys.argv) > 2 else "hi"
+    v_url = sys.argv[1]
+    tgt_lang = sys.argv[2] if len(sys.argv) > 2 else "hi"
 
-    v_file, a_file = download_media(url)
-    segs = transcribe_and_translate(a_file, target_lang=target_lang)
+    v_file, a_file, meta = download_media(v_url)
+    segs = transcribe_and_translate(a_file, target_lang=tgt_lang)
     asyncio.run(synthesize_audio(segs))
 
     render_dubbed_video(v_file, segs, "final_output.mp4")
     generate_srt(segs, "subtitles.srt")
-    print("🎉 Dubbing and metadata sanitization completed!")
