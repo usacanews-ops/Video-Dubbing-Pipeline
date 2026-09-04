@@ -6,6 +6,7 @@ import time
 import re
 import json
 import random
+import shutil
 import yt_dlp
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator, MyMemoryTranslator
@@ -47,6 +48,7 @@ def download_media(url: str) -> tuple[str, str, dict]:
 
     print(f"TITLE_EMIT: {meta_dict['title']}")
 
+    # Extract 16kHz Mono Audio for transcription
     subprocess.run([
         'ffmpeg', '-y', '-i', video_path,
         '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
@@ -81,6 +83,7 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
     if source_lang == target_lang:
         return clean_text
 
+    # Attempt 1: Google Translator with Retry & Backoff
     for _ in range(2):
         try:
             res = GoogleTranslator(source='auto', target=target_lang).translate(clean_text)
@@ -90,6 +93,7 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
         except Exception:
             time.sleep(0.4)
 
+    # Attempt 2: MyMemory Translator Fallback
     try:
         s_lang = source_lang if source_lang and source_lang != 'auto' else 'en'
         res = MyMemoryTranslator(source=s_lang, target=target_lang).translate(clean_text)
@@ -97,6 +101,19 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
             return res.strip()
     except Exception:
         pass
+
+    # Attempt 3: Sentence splitting
+    words = clean_text.split()
+    if len(words) > 3:
+        try:
+            half = len(words) // 2
+            p1 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[:half]))
+            p2 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[half:]))
+            combined = f"{p1} {p2}".strip()
+            if not is_invalid_output(combined):
+                return combined
+        except Exception:
+            pass
 
     return clean_text
 
@@ -114,7 +131,7 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     if not raw_list:
         return []
 
-    # Merge tight adjacent segments (< 0.2s)
+    # Merge tight pauses (< 0.2s)
     merged = [raw_list[0]]
     for s in raw_list[1:]:
         prev = merged[-1]
@@ -146,7 +163,7 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     return segments
 
 # ==========================================
-# 3. 🗣️ Speech Synthesis
+# 3. 🗣️ Speech Synthesis (+15% Rate)
 # ==========================================
 async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
     os.makedirs(temp_dir, exist_ok=True)
@@ -186,31 +203,30 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             seg["tts_dur"] = orig_dur
 
 # ==========================================
-# 4. ❄️ Frame Freeze & Time-Synchronized Assembly
+# 4. ❄️ Native Frame-Freeze Video Assembly
 # ==========================================
 def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], output_file: str):
     total_src_duration = get_duration(video_path)
     os.makedirs("chunks", exist_ok=True)
     concat_list = []
-    
+
     current_src_pos = 0.0
     accumulated_delay = 0.0
 
     print("🎬 Constructing time-synchronized timeline with dynamic last-frame freeze...")
 
-    # Build intermediate chunks
     for i, seg in enumerate(segments):
         s_start = max(current_src_pos, seg["orig_start"])
         s_end = min(total_src_duration, seg["orig_end"])
 
-        # 1. Play intervening gap (if any gap between previous dialogue and this one)
+        # 1. Play intervening gap (if any silence between previous dialogue and current)
         if s_start > current_src_pos + 0.05:
             gap_dur = s_start - current_src_pos
             gap_file = f"chunks/gap_{i}.mp4"
             cmd = [
                 'ffmpeg', '-y',
-                '-ss', f"{current_src_pos:.3f}",
                 '-i', video_path,
+                '-ss', f"{current_src_pos:.3f}",
                 '-t', f"{gap_dur:.3f}",
                 '-f', 'lavfi', '-t', f"{gap_dur:.3f}", '-i', 'anullsrc=r=44100:cl=stereo',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
@@ -220,79 +236,60 @@ def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], outpu
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             concat_list.append(gap_file)
 
-        # 2. Main dialogue video slice
+        # 2. Main dialogue segment duration & freeze calculation
         dial_dur = max(0.2, s_end - s_start)
         tts_dur = seg["tts_dur"]
-        
-        # Calculate freeze duration if Hindi TTS takes longer than dialogue slot
         freeze_dur = max(0.0, tts_dur - dial_dur)
 
-        # Record timeline anchors for SRT subtitles
         seg["dubbed_start"] = s_start + accumulated_delay
         seg["dubbed_end"] = s_end + accumulated_delay + freeze_dur
         accumulated_delay += freeze_dur
 
-        # Render dialogue clip with TTS voice
         dial_file = f"chunks/dial_{i}.mp4"
-        cmd = [
-            'ffmpeg', '-y',
-            '-ss', f"{s_start:.3f}",
-            '-i', video_path,
-            '-t', f"{dial_dur:.3f}",
-            '-i', seg["audio_file"],
-            '-map', '0:v:0',
-            '-map', '1:a:0',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
-            '-c:a', 'aac', '-b:a', '192k',
-            '-t', f"{dial_dur:.3f}",
-            dial_file
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        concat_list.append(dial_file)
 
-        # 3. If freeze required: extract the very last frame and hold it
-        if freeze_dur >= 0.15:
-            freeze_file = f"chunks/freeze_{i}.mp4"
-            last_frame_img = f"chunks/last_frame_{i}.jpg"
-            
-            # Grab last frame
-            subprocess.run([
+        if freeze_dur < 0.15:
+            # TTS fits inside slot: standard sync without freeze
+            cmd = [
                 'ffmpeg', '-y',
-                '-ss', f"{max(0.0, s_end - 0.05):.3f}",
                 '-i', video_path,
-                '-vframes', '1',
-                '-q:v', '2',
-                last_frame_img
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-            # Hold the frame as video with the remainder of TTS audio
-            remainder_audio = AudioSegment.from_file(seg["audio_file"])
-            rem_ms = int(dial_dur * 1000)
-            freeze_audio_seg = remainder_audio[rem_ms:] if len(remainder_audio) > rem_ms else AudioSegment.silent(duration=int(freeze_dur * 1000))
-            freeze_wav = f"chunks/freeze_audio_{i}.wav"
-            freeze_audio_seg.export(freeze_wav, format="wav")
-
-            cmd_freeze = [
-                'ffmpeg', '-y',
-                '-loop', '1', '-t', f"{freeze_dur:.3f}", '-i', last_frame_img,
-                '-i', freeze_wav,
+                '-ss', f"{s_start:.3f}",
+                '-t', f"{dial_dur:.3f}",
+                '-i', seg["audio_file"],
+                '-map', '0:v:0', '-map', '1:a:0',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
                 '-c:a', 'aac', '-b:a', '192k',
-                '-shortest', freeze_file
+                '-t', f"{dial_dur:.3f}",
+                dial_file
             ]
-            subprocess.run(cmd_freeze, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            concat_list.append(freeze_file)
+        else:
+            # TTS is longer: freeze the last video frame using tpad filter
+            total_clip_dur = dial_dur + freeze_dur
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', video_path,
+                '-ss', f"{s_start:.3f}",
+                '-t', f"{dial_dur:.3f}",
+                '-i', seg["audio_file"],
+                '-filter_complex', f'[0:v]tpad=stop_mode=clone:stop_duration={freeze_dur:.3f}[v]',
+                '-map', '[v]', '-map', '1:a:0',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '192k',
+                '-t', f"{total_clip_dur:.3f}",
+                dial_file
+            ]
 
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        concat_list.append(dial_file)
         current_src_pos = s_end
 
-    # 4. Tail slice (if video extends past the last dialogue)
+    # 3. Tail slice (remaining video after final dialogue)
     if current_src_pos < total_src_duration:
         tail_dur = total_src_duration - current_src_pos
         tail_file = "chunks/tail.mp4"
         cmd = [
             'ffmpeg', '-y',
-            '-ss', f"{current_src_pos:.3f}",
             '-i', video_path,
+            '-ss', f"{current_src_pos:.3f}",
             '-t', f"{tail_dur:.3f}",
             '-f', 'lavfi', '-t', f"{tail_dur:.3f}", '-i', 'anullsrc=r=44100:cl=stereo',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
@@ -302,29 +299,24 @@ def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], outpu
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         concat_list.append(tail_file)
 
-    # 5. Concatenate all slices into master output
+    # 4. Manifest Concat
     concat_txt = "chunks/concat_manifest.txt"
     with open(concat_txt, "w", encoding="utf-8") as f:
         for c in concat_list:
             f.write(f"file '{os.path.abspath(c)}'\n")
 
-    print("🛡️ Merging slices, purging metadata, and encoding master reel...")
+    print("🛡️ Merging slices, stripping metadata, and encoding final reel...")
     subprocess.run([
         'ffmpeg', '-y',
         '-f', 'concat', '-safe', '0', '-i', concat_txt,
-        '-map_metadata', '-1',
-        '-map_chapters', '-1',
-        '-fflags', '+bitexact',
-        '-flags:v', '+bitexact',
-        '-flags:a', '+bitexact',
+        '-map_metadata', '-1', '-map_chapters', '-1',
+        '-fflags', '+bitexact', '-flags:v', '+bitexact', '-flags:a', '+bitexact',
         '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '2600k',
         '-c:a', 'aac', '-b:a', '192k',
         output_file
     ], check=True)
 
-    # Clean temporary chunks directory
     try:
-        import shutil
         shutil.rmtree("chunks")
     except Exception:
         pass
