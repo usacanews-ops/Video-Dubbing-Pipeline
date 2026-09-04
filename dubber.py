@@ -60,7 +60,7 @@ def get_duration(file_path: str) -> float:
     return float(subprocess.check_output(cmd, shell=True).strip())
 
 # ==========================================
-# 2. 🛡️ Bulletproof Translation (Filters 500 Errors)
+# 2. 🛡️ Robust Translation & Filtering
 # ==========================================
 def is_invalid_output(text: str) -> bool:
     if not text:
@@ -81,17 +81,15 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
     if source_lang == target_lang:
         return clean_text
 
-    # Attempt 1: Google Translator with Retry & Error Scrubbing
-    for attempt in range(2):
+    for _ in range(2):
         try:
             res = GoogleTranslator(source='auto', target=target_lang).translate(clean_text)
             if res and not is_invalid_output(res) and res.strip().lower() != clean_text.lower():
-                time.sleep(random.uniform(0.15, 0.35))
+                time.sleep(random.uniform(0.1, 0.25))
                 return res.strip()
         except Exception:
-            time.sleep(0.5)
+            time.sleep(0.4)
 
-    # Attempt 2: MyMemory Translator Fallback
     try:
         s_lang = source_lang if source_lang and source_lang != 'auto' else 'en'
         res = MyMemoryTranslator(source=s_lang, target=target_lang).translate(clean_text)
@@ -100,20 +98,6 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
     except Exception:
         pass
 
-    # Attempt 3: Word-by-word chunking fallback if long
-    words = clean_text.split()
-    if len(words) > 3:
-        try:
-            half = len(words) // 2
-            p1 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[:half]))
-            p2 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[half:]))
-            combined = f"{p1} {p2}".strip()
-            if not is_invalid_output(combined):
-                return combined
-        except Exception:
-            pass
-
-    # Never pass an error page into audio synthesis
     return clean_text
 
 def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[dict]:
@@ -130,10 +114,11 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     if not raw_list:
         return []
 
+    # Merge tight adjacent segments (< 0.2s)
     merged = [raw_list[0]]
     for s in raw_list[1:]:
         prev = merged[-1]
-        if s["start"] - prev["end"] < 0.4:
+        if s["start"] - prev["end"] < 0.2:
             prev["end"] = max(prev["end"], s["end"])
             prev["text"] += " " + s["text"]
         else:
@@ -161,7 +146,7 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     return segments
 
 # ==========================================
-# 3. 🗣️ Speech Synthesis (+18% Snappy Rate)
+# 3. 🗣️ Speech Synthesis
 # ==========================================
 async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
     os.makedirs(temp_dir, exist_ok=True)
@@ -180,77 +165,174 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
         elif lang == "de":
             voice = "de-DE-ConradNeural"
 
-        # Safety check: Prevent edge-tts from speaking raw code/error messages
         clean_tts_text = re.sub(r'[\[\]\(\)\{\}\<\>\"\'\*\#\@]', '', text).strip()
+        orig_dur = max(0.4, seg["orig_end"] - seg["orig_start"])
+
         if is_invalid_output(clean_tts_text) or not clean_tts_text:
-            silent = AudioSegment.silent(duration=400)
+            silent = AudioSegment.silent(duration=int(orig_dur * 1000))
             silent.export(audio_file, format="mp3")
             seg["audio_file"] = audio_file
-            seg["tts_dur"] = 0.4
+            seg["tts_dur"] = orig_dur
             continue
 
         seg["audio_file"] = audio_file
         try:
-            communicate = edge_tts.Communicate(clean_tts_text, voice, rate="+18%")
+            communicate = edge_tts.Communicate(clean_tts_text, voice, rate="+15%")
             await communicate.save(audio_file)
             seg["tts_dur"] = get_duration(audio_file)
         except Exception:
-            dur = max(0.4, seg["orig_end"] - seg["orig_start"])
-            silent = AudioSegment.silent(duration=int(dur * 1000))
+            silent = AudioSegment.silent(duration=int(orig_dur * 1000))
             silent.export(audio_file, format="mp3")
-            seg["tts_dur"] = dur
+            seg["tts_dur"] = orig_dur
 
 # ==========================================
-# 4. 🎬 +12% Video Speed Up & Total Scrub
+# 4. ❄️ Frame Freeze & Time-Synchronized Assembly
 # ==========================================
-def render_dubbed_video(video_path: str, segments: list[dict], output_file: str):
-    orig_total_dur = get_duration(video_path)
+def render_dubbed_video_with_freeze(video_path: str, segments: list[dict], output_file: str):
+    total_src_duration = get_duration(video_path)
+    os.makedirs("chunks", exist_ok=True)
+    concat_list = []
+    
+    current_src_pos = 0.0
+    accumulated_delay = 0.0
 
-    timeline_cursor = 0.0
-    for seg in segments:
-        start_time = max(seg["orig_start"], timeline_cursor)
-        seg["new_start"] = start_time
-        seg["new_end"] = start_time + seg["tts_dur"]
-        timeline_cursor = seg["new_end"] + 0.1
+    print("🎬 Constructing time-synchronized timeline with dynamic last-frame freeze...")
 
-    final_audio_dur = max(orig_total_dur, timeline_cursor)
-    master_audio = AudioSegment.silent(duration=int((final_audio_dur + 1.5) * 1000))
+    # Build intermediate chunks
+    for i, seg in enumerate(segments):
+        s_start = max(current_src_pos, seg["orig_start"])
+        s_end = min(total_src_duration, seg["orig_end"])
 
-    for seg in segments:
-        clip = AudioSegment.from_file(seg["audio_file"])
-        master_audio = master_audio.overlay(clip, position=int(seg["new_start"] * 1000))
+        # 1. Play intervening gap (if any gap between previous dialogue and this one)
+        if s_start > current_src_pos + 0.05:
+            gap_dur = s_start - current_src_pos
+            gap_file = f"chunks/gap_{i}.mp4"
+            cmd = [
+                'ffmpeg', '-y',
+                '-ss', f"{current_src_pos:.3f}",
+                '-i', video_path,
+                '-t', f"{gap_dur:.3f}",
+                '-f', 'lavfi', '-t', f"{gap_dur:.3f}", '-i', 'anullsrc=r=44100:cl=stereo',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-shortest', gap_file
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            concat_list.append(gap_file)
 
-    master_audio_path = "temp_master_audio.wav"
-    master_audio.export(master_audio_path, format="wav")
+        # 2. Main dialogue video slice
+        dial_dur = max(0.2, s_end - s_start)
+        tts_dur = seg["tts_dur"]
+        
+        # Calculate freeze duration if Hindi TTS takes longer than dialogue slot
+        freeze_dur = max(0.0, tts_dur - dial_dur)
 
-    speed_factor = 1.12
-    cmd = [
+        # Record timeline anchors for SRT subtitles
+        seg["dubbed_start"] = s_start + accumulated_delay
+        seg["dubbed_end"] = s_end + accumulated_delay + freeze_dur
+        accumulated_delay += freeze_dur
+
+        # Render dialogue clip with TTS voice
+        dial_file = f"chunks/dial_{i}.mp4"
+        cmd = [
+            'ffmpeg', '-y',
+            '-ss', f"{s_start:.3f}",
+            '-i', video_path,
+            '-t', f"{dial_dur:.3f}",
+            '-i', seg["audio_file"],
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-t', f"{dial_dur:.3f}",
+            dial_file
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        concat_list.append(dial_file)
+
+        # 3. If freeze required: extract the very last frame and hold it
+        if freeze_dur >= 0.15:
+            freeze_file = f"chunks/freeze_{i}.mp4"
+            last_frame_img = f"chunks/last_frame_{i}.jpg"
+            
+            # Grab last frame
+            subprocess.run([
+                'ffmpeg', '-y',
+                '-ss', f"{max(0.0, s_end - 0.05):.3f}",
+                '-i', video_path,
+                '-vframes', '1',
+                '-q:v', '2',
+                last_frame_img
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+            # Hold the frame as video with the remainder of TTS audio
+            remainder_audio = AudioSegment.from_file(seg["audio_file"])
+            rem_ms = int(dial_dur * 1000)
+            freeze_audio_seg = remainder_audio[rem_ms:] if len(remainder_audio) > rem_ms else AudioSegment.silent(duration=int(freeze_dur * 1000))
+            freeze_wav = f"chunks/freeze_audio_{i}.wav"
+            freeze_audio_seg.export(freeze_wav, format="wav")
+
+            cmd_freeze = [
+                'ffmpeg', '-y',
+                '-loop', '1', '-t', f"{freeze_dur:.3f}", '-i', last_frame_img,
+                '-i', freeze_wav,
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '192k',
+                '-shortest', freeze_file
+            ]
+            subprocess.run(cmd_freeze, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            concat_list.append(freeze_file)
+
+        current_src_pos = s_end
+
+    # 4. Tail slice (if video extends past the last dialogue)
+    if current_src_pos < total_src_duration:
+        tail_dur = total_src_duration - current_src_pos
+        tail_file = "chunks/tail.mp4"
+        cmd = [
+            'ffmpeg', '-y',
+            '-ss', f"{current_src_pos:.3f}",
+            '-i', video_path,
+            '-t', f"{tail_dur:.3f}",
+            '-f', 'lavfi', '-t', f"{tail_dur:.3f}", '-i', 'anullsrc=r=44100:cl=stereo',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-shortest', tail_file
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        concat_list.append(tail_file)
+
+    # 5. Concatenate all slices into master output
+    concat_txt = "chunks/concat_manifest.txt"
+    with open(concat_txt, "w", encoding="utf-8") as f:
+        for c in concat_list:
+            f.write(f"file '{os.path.abspath(c)}'\n")
+
+    print("🛡️ Merging slices, purging metadata, and encoding master reel...")
+    subprocess.run([
         'ffmpeg', '-y',
-        '-i', video_path,
-        '-i', master_audio_path,
-        '-filter_complex', f'[0:v]setpts=PTS/{speed_factor},fps=30[v];[1:a]atempo={speed_factor}[a]',
-        '-map', '[v]',
-        '-map', '[a]',
+        '-f', 'concat', '-safe', '0', '-i', concat_txt,
         '-map_metadata', '-1',
         '-map_chapters', '-1',
         '-fflags', '+bitexact',
         '-flags:v', '+bitexact',
         '-flags:a', '+bitexact',
-        '-c:v', 'libx264',
-        '-preset', 'veryfast',
-        '-b:v', '2500k',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-shortest',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', '2600k',
+        '-c:a', 'aac', '-b:a', '192k',
         output_file
-    ]
-    subprocess.run(cmd, check=True)
+    ], check=True)
+
+    # Clean temporary chunks directory
+    try:
+        import shutil
+        shutil.rmtree("chunks")
+    except Exception:
+        pass
 
 # ==========================================
-# 5. 📝 Subtitle (.srt) Generation
+# 5. 📝 Synchronized Subtitles (.srt)
 # ==========================================
 def format_timestamp(seconds: float) -> str:
-    seconds = seconds / 1.12
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
@@ -260,13 +342,16 @@ def format_timestamp(seconds: float) -> str:
 def generate_srt(segments: list[dict], output_file: str = "subtitles.srt"):
     with open(output_file, "w", encoding="utf-8") as f:
         for i, seg in enumerate(segments, start=1):
-            start_str = format_timestamp(seg["new_start"])
-            end_str = format_timestamp(seg["new_end"])
+            start_str = format_timestamp(seg.get("dubbed_start", seg["orig_start"]))
+            end_str = format_timestamp(seg.get("dubbed_end", seg["orig_end"]))
             txt = seg['translated_text']
             if is_invalid_output(txt):
                 txt = ""
             f.write(f"{i}\n{start_str} --> {end_str}\n{txt}\n\n")
 
+# ==========================================
+# 🚀 Entrypoint
+# ==========================================
 if __name__ == "__main__":
     v_url = sys.argv[1]
     tgt_lang = sys.argv[2] if len(sys.argv) > 2 else "hi"
@@ -275,5 +360,6 @@ if __name__ == "__main__":
     segs = transcribe_and_translate(a_file, target_lang=tgt_lang)
     asyncio.run(synthesize_audio(segs))
 
-    render_dubbed_video(v_file, segs, "final_output.mp4")
+    render_dubbed_video_with_freeze(v_file, segs, "final_output.mp4")
     generate_srt(segs, "subtitles.srt")
+    print("✅ Perfectly synchronized dubbed video rendered with frame-freeze protection.")
