@@ -1,68 +1,97 @@
-import os,sys,subprocess,asyncio,time,re,json,shutil
+import os
+import sys
+import subprocess
+import asyncio
+import time
+import re
+import json
+import shutil
+import urllib.request
+import urllib.error
+
 import yt_dlp
 from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator,MyMemoryTranslator
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 import edge_tts
 from pydub import AudioSegment
 
-# ================= CONFIG =================
 
-TTS_RATE="+8%"
-FINAL_SPEED=1.10
-MAX_ATEMPO=1.12
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-VIDEO_CRF="27"
-VIDEO_PRESET="veryfast"
-AUDIO_BITRATE="128k"
+FINAL_SPEED = 1.10
+MAX_ATEMPO = 1.12
 
-SILENCE_THRESHOLD=-42
-SAFETY_GAP=0.04
-MAX_SENTENCE=8.0
-FREEZE_ENABLED=True
+TTS_RATE = "+8%"
 
-WHISPER_MODEL="tiny"
+VIDEO_CRF = "27"
+VIDEO_PRESET = "veryfast"
+AUDIO_BITRATE = "128k"
 
-# ---------- Hindi naturalization ----------
+WHISPER_MODEL = "tiny"
 
-NATURALIZE_HINDI=True
-GEMINI_MODEL="gemini-3.7-flash"
+SILENCE_THRESHOLD = -42
+SAFETY_GAP = 0.04
+MAX_SENTENCE = 8.0
 
-# Keep this reasonably low.
-# Naturalization is done once per sentence.
-GEMINI_MAX_OUTPUT=300
+FREEZE_ENABLED = True
 
-# ================= VOICES =================
+NATURALIZE_HINDI = True
+GEMINI_MODEL = "gemini-2.5-flash"
 
-VOICE_MAP={
-    "hi":"hi-IN-MadhurNeural",
-    "bn":"bn-IN-BashkarNeural",
-    "ta":"ta-IN-ValluvarNeural",
-    "te":"te-IN-MohanNeural",
-    "mr":"mr-IN-ManoharNeural",
-    "gu":"gu-IN-DhwaniNeural",
-    "kn":"kn-IN-GaganNeural",
-    "ml":"ml-IN-MidhunNeural",
-    "pa":"pa-IN-OjasNeural",
-    "en":"en-US-GuyNeural",
-    "fr":"fr-FR-HenriNeural",
-    "de":"de-DE-ConradNeural",
-    "es":"es-ES-AlvaroNeural",
-    "it":"it-IT-DiegoNeural",
-    "pt":"pt-BR-AntonioNeural",
-    "nl":"nl-NL-MaartenNeural",
-    "pl":"pl-PL-MarekNeural",
-    "tr":"tr-TR-AhmetNeural",
-    "ru":"ru-RU-DmitryNeural",
-    "uk":"uk-UA-OstapNeural",
-    "ja":"ja-JP-KeitaNeural",
-    "ko":"ko-KR-InJoonNeural",
-    "zh":"zh-CN-YunxiNeural",
-    "ar":"ar-SA-HamedNeural"
+TEMP_DIR = "temp_audio"
+
+OUTPUT_VIDEO = "final_output.mp4"
+OUTPUT_SRT = "subtitles.srt"
+
+
+# ============================================================
+# VOICE MAP
+# ============================================================
+
+VOICE_MAP = {
+    "hi": "hi-IN-MadhurNeural",
+    "bn": "bn-IN-BashkarNeural",
+    "ta": "ta-IN-ValluvarNeural",
+    "te": "te-IN-MohanNeural",
+    "mr": "mr-IN-ManoharNeural",
+    "gu": "gu-IN-DhwaniNeural",
+    "kn": "kn-IN-GaganNeural",
+    "ml": "ml-IN-MidhunNeural",
+    "pa": "pa-IN-OjasNeural",
+
+    "en": "en-US-GuyNeural",
+    "fr": "fr-FR-HenriNeural",
+    "de": "de-DE-ConradNeural",
+    "es": "es-ES-AlvaroNeural",
+    "it": "it-IT-DiegoNeural",
+    "pt": "pt-BR-AntonioNeural",
+    "nl": "nl-NL-MaartenNeural",
+    "pl": "pl-PL-MarekNeural",
+    "tr": "tr-TR-AhmetNeural",
+    "ru": "ru-RU-DmitryNeural",
+    "uk": "uk-UA-OstapNeural",
+    "ja": "ja-JP-KeitaNeural",
+    "ko": "ko-KR-InJoonNeural",
+    "zh": "zh-CN-YunxiNeural",
+    "ar": "ar-SA-HamedNeural"
 }
 
-# ================= FFMPEG =================
 
-def run(cmd,quiet=False):
+# ============================================================
+# UTILITIES
+# ============================================================
+
+def run(cmd, quiet=False):
+    print(
+        "▶ " +
+        " ".join(
+            f'"{x}"' if " " in str(x) else str(x)
+            for x in cmd
+        )
+    )
+
     if quiet:
         subprocess.run(
             cmd,
@@ -71,63 +100,95 @@ def run(cmd,quiet=False):
             check=True
         )
     else:
-        subprocess.run(cmd,check=True)
+        subprocess.run(
+            cmd,
+            check=True
+        )
 
-def duration(path):
-    return float(
-        subprocess.check_output([
+
+def get_duration(path):
+    result = subprocess.check_output(
+        [
             "ffprobe",
-            "-v","error",
-            "-show_entries","format=duration",
-            "-of","default=noprint_wrappers=1:nokey=1",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
             path
-        ]).strip()
+        ],
+        stderr=subprocess.STDOUT
     )
 
-# ================= DOWNLOAD =================
+    return float(result.strip())
+
+
+def file_size_mb(path):
+    if not os.path.exists(path):
+        return 0
+
+    return os.path.getsize(path) / 1048576
+
+
+# ============================================================
+# DOWNLOAD MEDIA
+# ============================================================
 
 def download_media(url):
 
-    video="raw_source.mp4"
-    audio="input_audio.wav"
+    video_path = "raw_source.mp4"
+    audio_path = "input_audio.wav"
 
-    for p in (video,audio):
-        if os.path.exists(p):
+    for path in (
+        video_path,
+        audio_path
+    ):
+        if os.path.exists(path):
             try:
-                os.remove(p)
+                os.remove(path)
             except:
                 pass
 
     print("📥 Downloading media...")
 
-    opts={
+    ydl_opts = {
         "format":
-        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "outtmpl":video,
-        "merge_output_format":"mp4",
-        "quiet":True,
-        "no_warnings":True
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+            "/best[ext=mp4]/best",
+        "outtmpl": video_path,
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True
     }
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info=ydl.extract_info(
+    with yt_dlp.YoutubeDL(
+        ydl_opts
+    ) as ydl:
+
+        info = ydl.extract_info(
             url,
             download=True
         )
 
-    meta={
-        "title":info.get(
-            "title",
-            "Dubbed Video"
-        ),
-        "description":info.get(
-            "description",
-            ""
-        ),
-        "tags":info.get(
-            "tags",
-            []
-        )
+    meta = {
+        "title":
+            info.get(
+                "title",
+                "Dubbed Video"
+            ),
+
+        "description":
+            info.get(
+                "description",
+                ""
+            ),
+
+        "tags":
+            info.get(
+                "tags",
+                []
+            )
     }
 
     with open(
@@ -135,6 +196,7 @@ def download_media(url):
         "w",
         encoding="utf-8"
     ) as f:
+
         json.dump(
             meta,
             f,
@@ -146,24 +208,43 @@ def download_media(url):
     )
 
     print(
-        "🎵 Extracting audio..."
+        "🎵 Extracting audio for Whisper..."
     )
 
-    run([
-        "ffmpeg","-y",
-        "-i",video,
-        "-vn",
-        "-ac","1",
-        "-ar","16000",
-        "-c:a","pcm_s16le",
-        audio
-    ],True)
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            audio_path
+        ],
+        quiet=True
+    )
 
-    return video,audio,meta
+    return (
+        video_path,
+        audio_path,
+        meta
+    )
 
-# ================= TRANSLATION =================
+
+# ============================================================
+# TRANSLATION HELPERS
+# ============================================================
 
 def contains_devanagari(text):
+
+    if not text:
+        return False
+
     return bool(
         re.search(
             r"[\u0900-\u097F]",
@@ -171,40 +252,45 @@ def contains_devanagari(text):
         )
     )
 
+
 def bad_translation(text):
 
     if not text:
         return True
 
-    t=text.lower()
+    lowered = text.lower()
 
-    return any(
-        x in t
-        for x in (
-            "<html",
-            "<!doctype",
-            "server error",
-            "captcha",
-            "unusual traffic"
-        )
+    bad = (
+        "<html",
+        "<!doctype",
+        "server error",
+        "captcha",
+        "unusual traffic"
     )
 
-def translate_hindi(text):
+    return any(
+        x in lowered
+        for x in bad
+    )
 
-    text=re.sub(
+
+def translate_to_hindi(text):
+
+    text = re.sub(
         r"[\r\n\t]+",
         " ",
         text
     ).strip()
 
-    if len(text)<2:
+    if len(text) < 2:
         return text
 
-    for _ in range(3):
+    # Google
+    for attempt in range(3):
 
         try:
 
-            result=GoogleTranslator(
+            result = GoogleTranslator(
                 source="auto",
                 target="hi"
             ).translate(text)
@@ -214,15 +300,20 @@ def translate_hindi(text):
                 and not bad_translation(result)
                 and contains_devanagari(result)
             ):
+
                 return result.strip()
 
-        except:
-            time.sleep(.25)
+        except Exception:
 
+            time.sleep(
+                0.3
+            )
+
+    # MyMemory fallback
     try:
 
-        result=MyMemoryTranslator(
-            source="auto",
+        result = MyMemoryTranslator(
+            source="en-US",
             target="hi-IN"
         ).translate(text)
 
@@ -231,171 +322,193 @@ def translate_hindi(text):
             and not bad_translation(result)
             and contains_devanagari(result)
         ):
+
             return result.strip()
 
-    except:
+    except Exception:
         pass
 
     return ""
 
-def translate(text,target):
 
-    if target=="hi":
-        return translate_hindi(text)
+def translate_text(
+    text,
+    target_lang
+):
 
-    text=re.sub(
+    if target_lang == "hi":
+        return translate_to_hindi(text)
+
+    text = re.sub(
         r"[\r\n\t]+",
         " ",
         text
     ).strip()
 
-    if len(text)<2:
+    if len(text) < 2:
         return text
 
     for _ in range(3):
 
         try:
 
-            result=GoogleTranslator(
+            result = GoogleTranslator(
                 source="auto",
-                target=target
+                target=target_lang
             ).translate(text)
 
             if (
                 result
                 and not bad_translation(result)
             ):
+
                 return result.strip()
 
-        except:
-            time.sleep(.25)
+        except Exception:
+
+            time.sleep(
+                0.3
+            )
 
     return text
 
-# ================= GEMINI NATURAL HINDI =================
+
+# ============================================================
+# NATURAL SPOKEN HINDI
+# ============================================================
 
 def naturalize_hindi(text):
 
     if not NATURALIZE_HINDI:
         return text
 
-    api_key=os.environ.get(
+    if not text:
+        return text
+
+    api_key = os.environ.get(
         "GEMINI_API_KEY"
     )
 
     if not api_key:
+
         print(
-            "⚠️ GEMINI_API_KEY not found. "
-            "Using translated Hindi."
+            "⚠️ GEMINI_API_KEY not set."
+            " Using normal Hindi translation."
         )
+
         return text
 
-    if not text or not contains_devanagari(text):
+    if not contains_devanagari(text):
         return text
 
-    prompt="""You are a professional Indian Hindi dubbing writer.
+    prompt = """
+You are a professional Indian Hindi dubbing writer.
 
-Rewrite the following Hindi translation into NATURAL, SIMPLE, SPOKEN INDIAN HINDI suitable for a video voice-over.
+Rewrite the following Hindi translation into natural, simple,
+spoken Indian Hindi for a video voice-over.
 
-This is NOT a request for a literal translation.
+IMPORTANT:
+This is NOT a new translation.
+Preserve the meaning of the existing Hindi.
 
 Rules:
-1. Keep the exact meaning.
-2. Do not add facts or information.
-3. Do not remove important information.
-4. Use everyday Hindi that ordinary Indian viewers easily understand.
-5. Avoid highly Sanskritized, literary or bookish Hindi.
-6. Prefer common spoken words.
-7. Use natural Hindi sentence structure.
-8. Shorter sentences are preferred when the meaning remains unchanged.
-9. You may naturally use commonly spoken English words when Indians normally use them.
-10. Keep names, places, organizations, brands, numbers and dates accurate.
-11. Do not translate proper names unnecessarily.
-12. Do not use quotation marks unless they are genuinely part of the sentence.
-13. Do not add explanations.
-14. Return ONLY the rewritten Hindi text.
-15. This text will be spoken by a TTS voice, so it must sound natural when spoken aloud.
+
+- Use everyday Hindi understood by ordinary Indian viewers.
+- Avoid difficult Sanskrit words.
+- Avoid overly formal, literary or bookish Hindi.
+- Prefer simple conversational Hindi.
+- Make it sound natural when spoken aloud.
+- Keep the original meaning exactly.
+- Do not add information.
+- Do not remove important information.
+- Keep names, places, organizations, brands and numbers unchanged.
+- Common English words may be used where Indians naturally use them.
+- Do not add explanations.
+- Do not add headings.
+- Do not add quotation marks.
+- Return ONLY the final Hindi sentence.
 
 Examples:
 
 Formal:
-"घटना के पश्चात उसे गिरफ्तार किया गया।"
+घटना के पश्चात उसे गिरफ्तार किया गया।
 
 Natural:
-"घटना के बाद उसे गिरफ्तार कर लिया गया।"
+घटना के बाद उसे गिरफ्तार कर लिया गया।
 
 Formal:
-"सरकार ने नवीन योजना की घोषणा की।"
+सरकार ने नवीन योजना की घोषणा की।
 
 Natural:
-"सरकार ने एक नई योजना का ऐलान किया।"
+सरकार ने एक नई योजना का ऐलान किया।
 
 Formal:
-"इस परिस्थिति के परिप्रेक्ष्य में प्रशासन ने महत्वपूर्ण निर्णय लिया।"
+इस परिस्थिति के परिप्रेक्ष्य में प्रशासन ने महत्वपूर्ण निर्णय लिया।
 
 Natural:
-"इस स्थिति को देखते हुए प्रशासन ने एक अहम फैसला लिया।"
+इस स्थिति को देखते हुए प्रशासन ने एक अहम फैसला लिया।
 
-Hindi text to rewrite:
+Now rewrite this Hindi:
+
 """ + text
 
-    payload={
-        "contents":[
+    payload = {
+        "contents": [
             {
-                "parts":[
+                "parts": [
                     {
-                        "text":prompt
+                        "text": prompt
                     }
                 ]
             }
         ],
-        "generationConfig":{
-            "maxOutputTokens":
-                GEMINI_MAX_OUTPUT
+
+        "generationConfig": {
+            "temperature": 0.25,
+            "maxOutputTokens": 300
         }
     }
 
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        "v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent"
+    )
+
+    data = json.dumps(
+        payload,
+        ensure_ascii=False
+    ).encode(
+        "utf-8"
+    )
+
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type":
+                "application/json",
+
+            "x-goog-api-key":
+                api_key
+        },
+        method="POST"
+    )
+
     try:
-
-        import urllib.request
-        import urllib.error
-
-        url=(
-            "https://generativelanguage.googleapis.com/"
-            "v1beta/models/"
-            +GEMINI_MODEL+
-            ":generateContent"
-        )
-
-        data=json.dumps(
-            payload,
-            ensure_ascii=False
-        ).encode("utf-8")
-
-        request=urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Content-Type":
-                    "application/json",
-                "x-goog-api-key":
-                    api_key
-            },
-            method="POST"
-        )
 
         with urllib.request.urlopen(
             request,
             timeout=30
         ) as response:
 
-            result=json.loads(
-                response.read().decode(
-                    "utf-8"
-                )
-            )
+            raw = response.read()
 
-        candidates=result.get(
+        result = json.loads(
+            raw.decode("utf-8")
+        )
+
+        candidates = result.get(
             "candidates",
             []
         )
@@ -403,25 +516,25 @@ Hindi text to rewrite:
         if not candidates:
             return text
 
-        parts=(
+        parts = (
             candidates[0]
-            .get("content",{})
-            .get("parts",[])
+            .get("content", {})
+            .get("parts", [])
         )
 
-        output="".join(
-            p.get("text","")
-            for p in parts
+        output = "".join(
+            part.get("text", "")
+            for part in parts
         ).strip()
 
-        output=re.sub(
-            r"^```(?:hindi|text)?\s*",
+        output = re.sub(
+            r"^```(?:text|hindi)?\s*",
             "",
             output,
             flags=re.I
         )
 
-        output=re.sub(
+        output = re.sub(
             r"\s*```$",
             "",
             output
@@ -430,22 +543,47 @@ Hindi text to rewrite:
         if (
             output
             and contains_devanagari(output)
-            and len(output)<max(
-                3000,
-                len(text)*4
-            )
+            and len(output) < 3000
         ):
+
             return output
+
+    except urllib.error.HTTPError as e:
+
+        try:
+            detail = e.read().decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+            print(
+                "⚠️ Gemini HTTP error:",
+                e.code,
+                detail[:500]
+            )
+
+        except:
+            print(
+                "⚠️ Gemini HTTP error:",
+                e.code
+            )
 
     except Exception as e:
 
         print(
-            f"⚠️ Hindi naturalization failed: {e}"
+            "⚠️ Gemini naturalization error:",
+            e
         )
 
+    # VERY IMPORTANT:
+    # Never allow naturalization failure
+    # to stop the dubbing process.
     return text
 
-# ================= WHISPER =================
+
+# ============================================================
+# WHISPER + TRANSLATION
+# ============================================================
 
 def transcribe_and_translate(
     audio_path,
@@ -456,7 +594,7 @@ def transcribe_and_translate(
         "🧠 Loading Whisper..."
     )
 
-    model=WhisperModel(
+    model = WhisperModel(
         WHISPER_MODEL,
         device="cpu",
         compute_type="int8"
@@ -466,12 +604,12 @@ def transcribe_and_translate(
         "🎙️ Transcribing..."
     )
 
-    raw_segments,info=model.transcribe(
+    raw_segments, info = model.transcribe(
         audio_path,
         language=None,
         vad_filter=True,
         vad_parameters={
-            "min_silence_duration_ms":350
+            "min_silence_duration_ms": 350
         }
     )
 
@@ -480,35 +618,48 @@ def transcribe_and_translate(
         f"{info.language}"
     )
 
-    raw=[]
+    raw = []
 
     for s in raw_segments:
 
-        text=s.text.strip()
+        text = s.text.strip()
 
         if not text:
             continue
 
-        if s.end-s.start<.2:
+        if (
+            s.end - s.start
+            < 0.2
+        ):
             continue
 
         raw.append({
-            "start":float(s.start),
-            "end":float(s.end),
-            "text":text
+            "start":
+                float(s.start),
+
+            "end":
+                float(s.end),
+
+            "text":
+                text
         })
 
     if not raw:
         return []
 
-    # ---------- semantic grouping ----------
+    # --------------------------------------------------------
+    # Semantic sentence grouping
+    # --------------------------------------------------------
 
-    blocks=[]
-    current=[]
-    current_start=raw[0]["start"]
-    current_end=raw[0]["end"]
+    blocks = []
 
-    endings=(
+    current = []
+
+    current_start = raw[0]["start"]
+
+    current_end = raw[0]["end"]
+
+    endings = (
         ".",
         "!",
         "?",
@@ -516,37 +667,44 @@ def transcribe_and_translate(
         "…"
     )
 
-    for i,s in enumerate(raw):
+    for i, segment in enumerate(raw):
 
         current.append(
-            s["text"]
+            segment["text"]
         )
 
-        current_end=s["end"]
-
-        terminal=s[
-            "text"
-        ].rstrip().endswith(
-            endings
+        current_end = (
+            segment["end"]
         )
 
-        acoustic_gap=False
+        terminal = (
+            segment["text"]
+            .rstrip()
+            .endswith(endings)
+        )
 
-        if i+1<len(raw):
+        acoustic_gap = False
 
-            gap=(
-                raw[i+1]["start"]
-                -s["end"]
+        if i + 1 < len(raw):
+
+            gap = (
+                raw[i + 1]["start"]
+                - segment["end"]
             )
 
-            acoustic_gap=gap>=.8
+            acoustic_gap = (
+                gap >= 0.8
+            )
 
-        too_long=(
-            current_end-current_start
-            >=MAX_SENTENCE
+        too_long = (
+            current_end
+            - current_start
+            >= MAX_SENTENCE
         )
 
-        last=i+1==len(raw)
+        last = (
+            i + 1 == len(raw)
+        )
 
         if (
             terminal
@@ -555,23 +713,29 @@ def transcribe_and_translate(
             or last
         ):
 
-            text=" ".join(
+            text = " ".join(
                 current
             ).strip()
 
             if text:
 
                 blocks.append({
-                    "start":current_start,
-                    "end":current_end,
-                    "text":text
+                    "start":
+                        current_start,
+
+                    "end":
+                        current_end,
+
+                    "text":
+                        text
                 })
 
-            current=[]
+            current = []
 
-            if i+1<len(raw):
-                current_start=(
-                    raw[i+1]["start"]
+            if i + 1 < len(raw):
+
+                current_start = (
+                    raw[i + 1]["start"]
                 )
 
     print(
@@ -579,78 +743,82 @@ def transcribe_and_translate(
         "semantic sentences."
     )
 
-    segments=[]
+    segments = []
 
-    for i,b in enumerate(blocks):
+    for i, block in enumerate(blocks):
 
-        if i+1<len(blocks):
+        if i + 1 < len(blocks):
 
-            next_start=(
-                blocks[i+1]["start"]
-            )
-
-            available=max(
-                .5,
-                next_start
-                -b["start"]
-                -SAFETY_GAP
+            available = max(
+                0.5,
+                blocks[i + 1]["start"]
+                - block["start"]
+                - SAFETY_GAP
             )
 
         else:
 
-            available=max(
-                .5,
-                b["end"]
-                -b["start"]
-                +2
+            available = max(
+                0.5,
+                block["end"]
+                - block["start"]
+                + 2.0
             )
 
-        translated=translate(
-            b["text"],
+        # ----------------------------------------------------
+        # First translation
+        # ----------------------------------------------------
+
+        translated = translate_text(
+            block["text"],
             target_lang
         )
 
         if not translated:
-            translated=b["text"]
 
-        # ---------- NATURAL HINDI ----------
+            translated = block["text"]
+
+        # ----------------------------------------------------
+        # Natural spoken Hindi
+        # ----------------------------------------------------
 
         if (
-            target_lang=="hi"
+            target_lang == "hi"
             and NATURALIZE_HINDI
         ):
 
             print(
-                f"🗣️ Naturalizing "
-                f"Hindi {i+1}/{len(blocks)}"
+                f"🗣️ Natural Hindi "
+                f"{i + 1}/{len(blocks)}"
             )
 
-            natural=naturalize_hindi(
+            natural = naturalize_hindi(
                 translated
             )
 
             if natural:
-                translated=natural
+                translated = natural
 
-        if i==0:
+        if i == 0:
 
             print(
                 "TRANSLATION_PREVIEW: "
-                +translated[:180]
+                + translated[:250]
             )
 
         segments.append({
 
-            "index":i,
+            "index":
+                i,
 
             "start":
-                b["start"],
+                float(block["start"]),
 
             "end":
-                b["end"],
+                float(block["end"]),
 
             "available_slot":
-                available,
+                float(available),
 
             "translated_text":
                 translated,
@@ -661,7 +829,10 @@ def transcribe_and_translate(
 
     return segments
 
-# ================= SILENCE =================
+
+# ============================================================
+# REMOVE TTS SILENCE
+# ============================================================
 
 def strip_dead_silence(
     source,
@@ -669,58 +840,69 @@ def strip_dead_silence(
     threshold=SILENCE_THRESHOLD
 ):
 
-    audio=AudioSegment.from_file(
+    audio = AudioSegment.from_file(
         source
     )
 
     if not audio:
         return
 
-    start=0
-    end=len(audio)
-    step=10
+    start = 0
+    end = len(audio)
 
+    step = 10
+
+    # Beginning
     for p in range(
         0,
         len(audio),
         step
     ):
 
-        chunk=audio[
-            p:p+step
+        chunk = audio[
+            p:p + step
         ]
 
-        if chunk.dBFS>threshold:
+        if (
+            chunk.dBFS
+            > threshold
+        ):
 
-            start=max(
+            start = max(
                 0,
-                p-15
+                p - 15
             )
 
             break
 
+    # End
     for p in range(
-        len(audio)-step,
+        len(audio) - step,
         0,
         -step
     ):
 
-        chunk=audio[
-            p:p+step
+        chunk = audio[
+            p:p + step
         ]
 
-        if chunk.dBFS>threshold:
+        if (
+            chunk.dBFS
+            > threshold
+        ):
 
-            end=min(
+            end = min(
                 len(audio),
-                p+step+15
+                p + step + 15
             )
 
             break
 
-    audio=audio[start:end]
+    audio = audio[
+        start:end
+    ]
 
-    audio=(
+    audio = (
         audio
         .set_frame_rate(44100)
         .set_channels(2)
@@ -731,7 +913,38 @@ def strip_dead_silence(
         format="wav"
     )
 
-# ================= TTS =================
+
+# ============================================================
+# AUDIO SPEED
+# ============================================================
+
+def change_audio_speed(
+    source,
+    output,
+    factor
+):
+
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            source,
+            "-filter:a",
+            f"atempo={factor:.5f}",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            output
+        ],
+        quiet=True
+    )
+
+
+# ============================================================
+# TTS
+# ============================================================
 
 async def generate_tts(
     text,
@@ -739,7 +952,7 @@ async def generate_tts(
     output
 ):
 
-    communicate=edge_tts.Communicate(
+    communicate = edge_tts.Communicate(
         text,
         voice,
         rate=TTS_RATE
@@ -749,52 +962,42 @@ async def generate_tts(
         output
     )
 
-def change_speed(
-    source,
-    output,
-    factor
-):
-
-    run([
-        "ffmpeg","-y",
-        "-i",source,
-        "-filter:a",
-        f"atempo={factor:.5f}",
-        "-ar","44100",
-        "-ac","2",
-        output
-    ],True)
 
 async def synthesize_audio(
     segments,
-    temp_dir="temp_audio"
+    temp_dir=TEMP_DIR
 ):
 
-    if os.path.exists(temp_dir):
+    if os.path.exists(
+        temp_dir
+    ):
+
         shutil.rmtree(
             temp_dir
         )
 
     os.makedirs(
-        temp_dir
+        temp_dir,
+        exist_ok=True
     )
 
-    for i,seg in enumerate(
+    for i, seg in enumerate(
         segments
     ):
 
-        text=seg[
-            "translated_text"
-        ].strip()
+        text = (
+            seg["translated_text"]
+            .strip()
+        )
 
         if not text:
 
-            seg["clip_file"]=None
-            seg["tts_duration"]=0
+            seg["clip_file"] = None
+            seg["tts_duration"] = 0
 
             continue
 
-        lang=(
+        lang = (
             seg.get(
                 "target_lang",
                 "hi"
@@ -803,29 +1006,29 @@ async def synthesize_audio(
             .split("-")[0]
         )
 
-        voice=VOICE_MAP.get(
+        voice = VOICE_MAP.get(
             lang,
             "en-US-GuyNeural"
         )
 
-        raw=os.path.join(
+        raw = os.path.join(
             temp_dir,
             f"raw_{i}.mp3"
         )
 
-        clean=os.path.join(
+        clean = os.path.join(
             temp_dir,
             f"clean_{i}.wav"
         )
 
-        fitted=os.path.join(
+        fitted = os.path.join(
             temp_dir,
             f"fit_{i}.wav"
         )
 
         print(
-            f"🔊 TTS {i+1}/"
-            f"{len(segments)}"
+            f"🔊 TTS "
+            f"{i + 1}/{len(segments)}"
         )
 
         try:
@@ -841,245 +1044,46 @@ async def synthesize_audio(
                 clean
             )
 
-            original_duration=duration(
-                clean
+            original_duration = (
+                get_duration(clean)
             )
 
-            available=seg[
-                "available_slot"
-            ]
+            available = (
+                seg["available_slot"]
+            )
 
-            ratio=(
+            ratio = (
                 original_duration
-                /available
+                / available
             )
 
-            # Controlled compression.
-            if ratio>1.0:
+            if ratio > 1.0:
 
-                factor=min(
+                factor = min(
                     ratio,
                     MAX_ATEMPO
                 )
 
-                change_speed(
+                change_audio_speed(
                     clean,
                     fitted,
                     factor
                 )
 
-                final_file=fitted
+                final_file = fitted
 
-                final_duration=(
+                final_duration = (
                     original_duration
-                    /factor
+                    / factor
                 )
 
                 seg[
                     "audio_speed"
-                ]=factor
+                ] = factor
 
             else:
 
-                final_file=clean
+                final_file = clean
 
-                final_duration=(
-                    original_duration
-                )
-
-                seg[
-                    "audio_speed"
-                ]=1.0
-
-            seg[
-                "clip_file"
-            ]=final_file
-
-            seg[
-                "tts_duration"
-            ]=final_duration
-
-            print(
-                f"   TTS="
-                f"{original_duration:.2f}s "
-                f"final="
-                f"{final_duration:.2f}s "
-                f"speed="
-                f"{seg['audio_speed']:.3f}x"
-            )
-
-        except Exception as e:
-
-            print(
-                f"⚠️ TTS error {i}: {e}"
-            )
-
-            seg[
-                "clip_file"
-            ]=None
-
-            seg[
-                "tts_duration"
-            ]=0
-
-# ================= TIMELINE =================
-
-def build_timeline(segments):
-
-    cursor=0.0
-
-    for i,seg in enumerate(
-        segments
-    ):
-
-        original_start=(
-            seg["start"]
-        )
-
-        available=(
-            seg["available_slot"]
-        )
-
-        speech=(
-            seg["tts_duration"]
-        )
-
-        start=max(
-            original_start,
-            cursor
-        )
-
-        speech_end=(
-            start+speech
-        )
-
-        normal_end=(
-            start+available
-        )
-
-        freeze=max(
-            0.0,
-            speech_end-normal_end
-        )
-
-        if not FREEZE_ENABLED:
-            freeze=0.0
-
-        visual_end=max(
-            normal_end+freeze,
-            speech_end
-        )
-
-        seg[
-            "final_start"
-        ]=start
-
-        seg[
-            "speech_end"
-        ]=speech_end
-
-        seg[
-            "freeze_duration"
-        ]=freeze
-
-        seg[
-            "visual_end"
-        ]=visual_end
-
-        cursor=visual_end
-
-        print(
-            f"⏱ {i+1}: "
-            f"start={start:.2f} "
-            f"speech={speech:.2f} "
-            f"slot={available:.2f} "
-            f"freeze={freeze:.2f} "
-            f"next={cursor:.2f}"
-        )
-
-    return segments
-
-# ================= MASTER AUDIO =================
-
-def create_master_audio(
-    segments,
-    total_duration,
-    output
-):
-
-    print(
-        "🎧 Building synchronized audio..."
-    )
-
-    master=AudioSegment.silent(
-        duration=int(
-            (total_duration+.5)*1000
-        ),
-        frame_rate=44100
-    ).set_channels(2)
-
-    for seg in segments:
-
-        clip_file=seg.get(
-            "clip_file"
-        )
-
-        if (
-            not clip_file
-            or not os.path.exists(
-                clip_file
-            )
-        ):
-            continue
-
-        clip=(
-            AudioSegment
-            .from_file(
-                clip_file
-            )
-            .set_frame_rate(
-                44100
-            )
-            .set_channels(
-                2
-            )
-        )
-
-        position=int(
-            seg["final_start"]
-            *1000
-        )
-
-        master=master.overlay(
-            clip,
-            position=position
-        )
-
-    master.export(
-        output,
-        format="wav"
-    )
-
-# ================= ONE-PASS VIDEO =================
-
-def render_video(
-    source,
-    segments,
-    output
-):
-
-    source_duration=duration(
-        source
-    )
-
-    print(
-        "🎬 Rendering video in "
-        "ONE encode..."
-    )
-
-    filters=[]
-    labels=[]
-
-    # ---------- opening ----------
-
-    fir
+                final_duration = (
+  
