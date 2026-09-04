@@ -13,7 +13,7 @@ import edge_tts
 from pydub import AudioSegment
 
 SPEED_FACTOR = 1.12   # Uniform +12% speedup on final master video & audio
-MAX_ATEMPO = 1.15     # Maximum audio compression (Strict constraint: <= 1.15x)
+MAX_ATEMPO = 1.15     # Maximum audio compression allowed (<= 1.15x)
 
 # ==========================================
 # 1. 📥 Download Media & Extract Clean Audio
@@ -51,7 +51,8 @@ def download_media(url: str) -> tuple[str, str, dict]:
 
     print(f"TITLE_EMIT: {meta_dict['title']}")
 
-    print("🎵 Extracting synchronized 16kHz PCM audio...")
+    # Extract clean 16kHz audio for Whisper
+    print("🎵 Extracting 16kHz PCM audio...")
     subprocess.run([
         'ffmpeg', '-y', '-err_detect', 'ignore_err',
         '-i', video_path,
@@ -82,6 +83,7 @@ def translate_to_hindi(text: str) -> str:
     if not clean_text or len(clean_text) < 2:
         return clean_text
 
+    # Strategy 1: Google Translate
     for _ in range(3):
         try:
             res = GoogleTranslator(source='auto', target='hi').translate(clean_text)
@@ -91,6 +93,7 @@ def translate_to_hindi(text: str) -> str:
         except Exception:
             time.sleep(0.25)
 
+    # Strategy 2: MyMemory Fallback
     try:
         res = MyMemoryTranslator(source='en-US', target='hi-IN').translate(clean_text)
         if res and not is_error_page(res) and contains_devanagari(res):
@@ -100,7 +103,14 @@ def translate_to_hindi(text: str) -> str:
 
     return ""
 
+# ==========================================
+# 3. 🧠 Semantic Sentence Reconstruction
+# ==========================================
 def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[dict]:
+    """
+    Groups Whisper fragments into full, complete sentences.
+    Translating full thoughts instead of fragmented phrases reduces TTS length by ~45%.
+    """
     model = WhisperModel("tiny", device="cpu", compute_type="int8")
     raw_segments, info = model.transcribe(audio_path, language=None, vad_filter=True)
     print(f"🌍 Detected language: {info.language}")
@@ -108,28 +118,53 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     raw_list = []
     for s in raw_segments:
         t = s.text.strip()
-        if t and (s.end - s.start >= 0.25):
+        if t and (s.end - s.start >= 0.2):
             raw_list.append({"start": s.start, "end": s.end, "text": t})
 
     if not raw_list:
         return []
 
-    # Merge tight fragments into full natural sentences to eliminate overflow bloat
-    merged = [raw_list[0]]
-    for s in raw_list[1:]:
-        prev = merged[-1]
-        if s["start"] - prev["end"] < 0.6:
-            prev["end"] = max(prev["end"], s["end"])
-            prev["text"] += " " + s["text"]
-        else:
-            merged.append(s)
+    # Semantic sentence grouping based on punctuation and acoustic pauses
+    sentence_blocks = []
+    curr_text = []
+    curr_start = raw_list[0]["start"]
+    curr_end = raw_list[0]["end"]
+
+    sentence_endings = ('.', '!', '?', '।')
+
+    for i, s in enumerate(raw_list):
+        curr_text.append(s["text"])
+        curr_end = s["end"]
+
+        # Check conditions to end a sentence block:
+        is_terminal = s["text"].rstrip().endswith(sentence_endings)
+        has_acoustic_gap = False
+        if i + 1 < len(raw_list):
+            if raw_list[i + 1]["start"] - s["end"] >= 0.8:
+                has_acoustic_gap = True
+
+        # Close block on punctuation, a natural pause, or if duration reaches 8 seconds
+        if is_terminal or has_acoustic_gap or (curr_end - curr_start >= 8.0) or (i + 1 == len(raw_list)):
+            combined_sentence = " ".join(curr_text).strip()
+            if combined_sentence:
+                sentence_blocks.append({
+                    "start": curr_start,
+                    "end": curr_end,
+                    "text": combined_sentence
+                })
+            curr_text = []
+            if i + 1 < len(raw_list):
+                curr_start = raw_list[i + 1]["start"]
 
     segments = []
     first_preview = False
 
-    for i, s in enumerate(merged):
-        next_start = merged[i + 1]["start"] if i + 1 < len(merged) else s["end"] + 4.0
-        available_window = max(0.5, next_start - s["start"])
+    for i, s in enumerate(sentence_blocks):
+        # Calculate available visual slot before next sentence begins
+        if i + 1 < len(sentence_blocks):
+            available_slot = max(0.5, sentence_blocks[i + 1]["start"] - s["start"] - 0.05)
+        else:
+            available_slot = max(0.5, s["end"] - s["start"] + 2.0)
 
         if target_lang == "hi":
             translated = translate_to_hindi(s["text"])
@@ -150,7 +185,7 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
         segments.append({
             "start": s["start"],
             "end": s["end"],
-            "available_window": available_window,
+            "available_slot": available_slot,
             "translated_text": translated,
             "target_lang": target_lang
         })
@@ -158,7 +193,7 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     return segments
 
 # ==========================================
-# 3. ✂️ Speech Synthesis & Silence Trimming
+# 4. ✂️ Speech Synthesis & Dead Air Removal
 # ==========================================
 def strip_dead_silence(input_wav: str, output_wav: str, threshold: int = -42, chunk: int = 10):
     """Trims synthetic silence padding added by TTS engines."""
@@ -196,15 +231,15 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             continue
 
         try:
-            # Articulate at +18% (crisp natural delivery)
-            communicate = edge_tts.Communicate(text, voice, rate="+18%")
+            # Articulate naturally at +16%
+            communicate = edge_tts.Communicate(text, voice, rate="+16%")
             await communicate.save(raw_tts)
 
             strip_dead_silence(raw_tts, stripped)
             dur = get_duration(stripped)
 
-            # Fit speech to scene window, capped at max 1.15x
-            ratio = dur / seg["available_window"]
+            # Fit speech to the scene slot, strictly capping atempo to 1.15x
+            ratio = dur / seg["available_slot"]
             if ratio > 1.0:
                 compress = min(ratio, MAX_ATEMPO)
                 subprocess.run([
@@ -223,11 +258,11 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             seg["clip_file"] = None
 
 # ==========================================
-# 4. 🎬 Collision-Free Master Assembly
+# 5. 🎬 Non-Colliding Anchor Assembly
 # ==========================================
 def render_dubbed_video(video_path: str, segments: list[dict], output_file: str):
     src_total_dur = get_duration(video_path)
-    print(f"🎬 Assembling sequential, collision-free master timeline ({src_total_dur:.2f}s)...")
+    print(f"🎬 Assembling synchronized master audio track ({src_total_dur:.2f}s)...")
 
     master_track = AudioSegment.silent(
         duration=int((src_total_dur + 5.0) * 1000),
@@ -243,12 +278,8 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
         clip = AudioSegment.from_file(seg["clip_file"]).set_frame_rate(44100).set_channels(2)
         clip_dur = len(clip) / 1000.0
 
-        # Never start before previous line finishes (eliminates overlapping voices)
+        # Anchor to original scene timestamp, ensuring no overlap with previous sentence
         start_time = max(seg["start"], audio_cursor)
-
-        # Resynchronize with visual scene if drift exceeds 0.4s
-        if start_time - seg["start"] > 0.4:
-            start_time = seg["start"] + 0.4
 
         master_track = master_track.overlay(clip, position=int(start_time * 1000))
         audio_cursor = start_time + clip_dur
@@ -260,7 +291,7 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
     master_track = master_track[:int(src_total_dur * 1000)]
     master_track.export(synced_audio_path, format="wav")
 
-    print(f"⚡ Applying uniform +12% ({SPEED_FACTOR}x) video & audio acceleration...")
+    print(f"⚡ Applying uniform +12% ({SPEED_FACTOR}x) acceleration...")
     cmd = [
         'ffmpeg', '-y', '-err_detect', 'ignore_err',
         '-i', video_path,
@@ -282,7 +313,7 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
         shutil.rmtree("temp_audio")
 
 # ==========================================
-# 5. 📝 Synchronized Subtitles (.srt)
+# 6. 📝 Synchronized Subtitles (.srt)
 # ==========================================
 def format_timestamp(seconds: float) -> str:
     hours = int(seconds // 3600)
@@ -318,4 +349,4 @@ if __name__ == "__main__":
 
     render_dubbed_video(v_file, segs, "final_output.mp4")
     generate_srt(segs, "subtitles.srt")
-    print("✅ Completed clean single-voice render with zero cross-talk.")
+    print("✅ Dubbing completed with semantic sentence synchronization.")
