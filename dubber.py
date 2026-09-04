@@ -215,7 +215,12 @@ def invalid_translation(text):
         "captcha",
         "access denied",
         "server error",
-        "unusual traffic"
+        "unusual traffic",
+        "invalid language",
+        "languages are supported",
+        "is an invalid language",
+        "traceback",
+        "exception"
     )
 
     return any(item in value for item in bad_values)
@@ -231,8 +236,8 @@ def naturalize_with_gemini(text, target_lang="hi"):
         return None
 
     lang_names = {
-        "hi": "natural spoken Hindi",
-        "pa": "natural spoken Punjabi",
+        "hi": "natural spoken Hindi (Devanagari script only)",
+        "pa": "natural spoken Punjabi (Gurmukhi script only)",
         "bn": "natural spoken Bengali",
         "ta": "natural spoken Tamil",
         "te": "natural spoken Telugu",
@@ -244,11 +249,10 @@ def naturalize_with_gemini(text, target_lang="hi"):
     prompt = (
         f"Translate and adapt the following sentence into {target_desc} for video dubbing.\n"
         "Rules:\n"
-        "- Use common everyday conversational words.\n"
-        "- Do not use overly formal or literary words.\n"
-        "- Retain English brand names, technical terms, and numbers as commonly spoken.\n"
-        "- Output ONLY the final spoken sentence. Do not add quotes, commentary, notes, or alternatives.\n\n"
-        f"Text: {text}"
+        "- Use simple, natural everyday spoken conversational phrasing.\n"
+        "- Retain brand names, technical terms, and numbers as commonly spoken.\n"
+        "- Return ONLY the translated sentence in the target script. No English explanation, notes, or quotes.\n\n"
+        f"Sentence: {text}"
     )
 
     payload = {
@@ -283,29 +287,39 @@ def naturalize_with_gemini(text, target_lang="hi"):
             result = re.sub(r"^```(?:text|hindi)?\s*", "", result, flags=re.I)
             result = re.sub(r"\s*```$", "", result).strip()
             result = re.sub(r"^[\"']|[\"']$", "", result)
-            return clean_text(result)
+            result = clean_text(result)
+            if target_lang == "hi" and not contains_hindi(result):
+                return None
+            return result
     except Exception as e:
-        print(f"⚠️ Gemini processing error: {e}")
+        print(f"⚠️ Gemini translation error: {e}")
 
     return None
 
 
-def translate_text(text, target):
+def translate_text(text, target, source_lang="en"):
     text = clean_text(text)
     if len(text) < 2:
         return text
 
-    # Try Gemini directly if API key is present
+    # Try Gemini first if key is present
     gemini_result = naturalize_with_gemini(text, target)
     if gemini_result and not invalid_translation(gemini_result):
         return gemini_result
 
-    # GoogleTranslator fallback
+    # Safe source language detection
+    src = (source_lang or "en").lower()
+    tgt = (target or "hi").lower()
+
+    # Google Translator fallback
     for attempt in range(3):
         try:
-            result = GoogleTranslator(source="auto", target=target).translate(text)
+            # Avoid using 'auto' since it triggers library-side invalid language errors
+            result = GoogleTranslator(source=src, target=tgt).translate(text)
             if result and not invalid_translation(result):
-                return clean_text(result)
+                cleaned = clean_text(result)
+                if tgt != "hi" or contains_hindi(cleaned):
+                    return cleaned
         except Exception:
             time.sleep(0.4)
 
@@ -318,12 +332,16 @@ def translate_text(text, target):
         "pl": "polish", "tr": "turkish", "ru": "russian", "uk": "ukrainian",
         "ja": "japanese", "ko": "korean", "zh": "chinese", "ar": "arabic"
     }
-    mm_target = mymemory_codes.get(target.lower(), target)
+
+    mm_src = mymemory_codes.get(src, "english")
+    mm_tgt = mymemory_codes.get(tgt, "hindi")
 
     try:
-        result = MyMemoryTranslator(source="auto", target=mm_target).translate(text)
+        result = MyMemoryTranslator(source=mm_src, target=mm_tgt).translate(text)
         if result and not invalid_translation(result):
-            return clean_text(result)
+            cleaned = clean_text(result)
+            if tgt != "hi" or contains_hindi(cleaned):
+                return cleaned
     except Exception:
         pass
 
@@ -353,7 +371,8 @@ def transcribe(audio_path, target_lang):
         vad_parameters={"min_silence_duration_ms": 300}
     )
 
-    print("🌍 Detected language:", info.language)
+    detected_lang = info.language or "en"
+    print(f"🌍 Detected language: {detected_lang}")
 
     raw = []
     for item in result:
@@ -409,7 +428,7 @@ def transcribe(audio_path, target_lang):
             slot = max(0.30, end - start)
 
         print(f"Translating block {i + 1}/{len(blocks)}...")
-        translated = translate_text(block["text"], target_lang)
+        translated = translate_text(block["text"], target_lang, source_lang=detected_lang)
 
         segments.append({
             "index": i,
@@ -508,7 +527,7 @@ def prepare_tts(segments):
 
     for i, segment in enumerate(segments):
         text = clean_text(segment["translated_text"])
-        if not text:
+        if not text or invalid_translation(text):
             text = clean_text(segment["source_text"])
             segment["translated_text"] = text
 
@@ -681,259 +700,4 @@ def render_video(source, segments, source_duration, output):
     if prev_end < source_duration - 0.01:
         lbl = new_label()
         filters.append(
-            f"[0:v]trim=start={prev_end:.6f}:end={source_duration:.6f},"
-            f"setpts=PTS-STARTPTS[{lbl}]"
-        )
-        labels.append(f"[{lbl}]")
-
-    if not labels:
-        lbl = new_label()
-        filters.append(f"[0:v]setpts=PTS-STARTPTS[{lbl}]")
-        labels.append(f"[{lbl}]")
-
-    if len(labels) == 1:
-        filters.append(f"{labels[0]}setpts=PTS-STARTPTS[joined]")
-    else:
-        concat_inputs = "".join(labels)
-        filters.append(f"{concat_inputs}concat=n={len(labels)}:v=1:a=0,setpts=PTS-STARTPTS[joined]")
-
-    filters.append(f"[joined]setpts=PTS/{FINAL_SPEED:.6f}[vout]")
-
-    run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            source,
-            "-filter_complex",
-            ";".join(filters),
-            "-map",
-            "[vout]",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            VIDEO_PRESET,
-            "-crf",
-            VIDEO_CRF,
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            output
-        ],
-        quiet=False
-    )
-
-    if not os.path.exists(output):
-        raise RuntimeError("Video rendering failed.")
-
-
-# ============================================================
-# FINAL AUDIO + VIDEO
-# ============================================================
-
-def mux_final(video, audio, output):
-    print("🎧 Muxing final MP4...")
-
-    temporary = output + ".tmp.mp4"
-    if os.path.exists(temporary):
-        os.remove(temporary)
-
-    run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            video,
-            "-i",
-            audio,
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-af",
-            f"atempo={FINAL_SPEED:.6f}",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            AUDIO_BITRATE,
-            "-movflags",
-            "+faststart",
-            "-shortest",
-            temporary
-        ],
-        quiet=False
-    )
-
-    if not os.path.exists(temporary):
-        raise RuntimeError("Final MP4 was not generated.")
-
-    if os.path.exists(output):
-        os.remove(output)
-
-    os.replace(temporary, output)
-
-
-# ============================================================
-# SRT
-# ============================================================
-
-def timestamp(seconds):
-    milliseconds = max(0, int(round(seconds * 1000)))
-    hours = milliseconds // 3600000
-    milliseconds %= 3600000
-    minutes = milliseconds // 60000
-    milliseconds %= 60000
-    seconds_value = milliseconds // 1000
-    milliseconds %= 1000
-
-    return f"{hours:02d}:{minutes:02d}:{seconds_value:02d},{milliseconds:03d}"
-
-
-def write_srt(segments, output):
-    print("📝 Writing SRT...")
-
-    counter = 0
-    with open(output, "w", encoding="utf-8") as f:
-        for segment in segments:
-            text = clean_text(segment.get("translated_text", ""))
-            if not text:
-                continue
-
-            counter += 1
-            start = float(segment["audio_start"]) / FINAL_SPEED
-            end = float(segment["audio_end"]) / FINAL_SPEED
-
-            f.write(str(counter) + "\n")
-            f.write(f"{timestamp(start)} --> {timestamp(end)}\n")
-            f.write(text + "\n\n")
-
-    print(f"✅ SRT: {counter} subtitles")
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
-
-def cleanup():
-    paths = (
-        TEMP_DIR,
-        "raw_source.mp4",
-        "input_audio.wav",
-        "synced_master.wav",
-        "extended_video.mp4"
-    )
-
-    for path in paths:
-        try:
-            if os.path.isdir(path):
-                shutil.rmtree(path)
-            elif os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-    if len(sys.argv) < 2:
-        print('Usage: python dubber.py "VIDEO_URL" [language]')
-        sys.exit(1)
-
-    url = sys.argv[1]
-    target_lang = sys.argv[2].lower() if len(sys.argv) > 2 else "hi"
-
-    started = time.time()
-
-    print()
-    print("=" * 65)
-    print("                 AI VIDEO DUBBER")
-    print("=" * 65)
-    print("Target language:", target_lang)
-    print("Final speed:", FINAL_SPEED)
-    print("Max sentence speed:", MAX_SENTENCE_SPEED)
-    print("Freeze:", FREEZE_ENABLED)
-    print("=" * 65)
-    print()
-
-    try:
-        # 1. DOWNLOAD
-        source_video, source_audio, metadata = download_media(url)
-        source_duration = get_duration(source_video)
-
-        print(f"Source duration: {source_duration:.2f}s")
-        print(f"Source size: {size_mb(source_video):.2f} MB")
-
-        # 2. TRANSCRIBE
-        segments = transcribe(source_audio, target_lang)
-        if not segments:
-            raise RuntimeError("No speech was detected.")
-
-        # 3. TTS
-        prepare_tts(segments)
-
-        # 4. TIMELINE & OVERLAP FIX
-        output_duration = calculate_timeline(segments, source_duration)
-        print(f"Timeline duration: {output_duration:.2f}s")
-
-        # 5. AUDIO
-        master_audio = "synced_master.wav"
-        build_master_audio(segments, output_duration, master_audio)
-
-        # 6. SUBTITLES
-        write_srt(segments, OUTPUT_SRT)
-
-        # 7. VIDEO
-        intermediate_video = "extended_video.mp4"
-        render_video(source_video, segments, source_duration, intermediate_video)
-
-        # 8. FINAL MP4
-        mux_final(intermediate_video, master_audio, OUTPUT_VIDEO)
-
-        # 9. VERIFY
-        if not os.path.exists(OUTPUT_VIDEO):
-            raise RuntimeError("final_output.mp4 was not created.")
-
-        final_size = size_mb(OUTPUT_VIDEO)
-        final_duration = get_duration(OUTPUT_VIDEO)
-        failures = sum(1 for s in segments if s.get("tts_failed", False))
-        elapsed = time.time() - started
-
-        print()
-        print("=" * 65)
-        print("                    COMPLETE")
-        print("=" * 65)
-        print(f"Source size : {size_mb(source_video):.2f} MB")
-        print(f"Final size  : {final_size:.2f} MB")
-        print(f"Source time : {source_duration:.2f}s")
-        print(f"Final time  : {final_duration:.2f}s")
-        print(f"Speed       : {FINAL_SPEED:.2f}x")
-        print(f"TTS failures: {failures}")
-        print(f"Processing  : {elapsed / 60:.2f} minutes")
-        print()
-        print("🎬 final_output.mp4")
-        print("📝 subtitles.srt")
-        print("=" * 65)
-
-        cleanup()
-
-    except Exception as e:
-        print()
-        print("=" * 65)
-        print("                    FAILED")
-        print("=" * 65)
-        print("❌", str(e))
-        print()
-        print("Temporary files have been kept.")
-        print("=" * 65)
-        raise
-
-
-if __name__ == "__main__":
-    main()
+            f"[0:v]trim=start={prev_end:.6f}:end={sourc
