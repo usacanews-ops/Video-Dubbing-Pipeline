@@ -1,585 +1,1153 @@
-import os
-import sys
-import subprocess
-import asyncio
-import time
-import re
-import json
-import shutil
+import os,sys,subprocess,asyncio,time,re,json,shutil,random
 import yt_dlp
 from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator import GoogleTranslator,MyMemoryTranslator
 import edge_tts
 from pydub import AudioSegment
 
 # ================= CONFIG =================
 
-# 1. Pacing & Speed
-TTS_RATE = "+15%"          # Fast, natural articulation
-FINAL_SPEED = 1.10         # Exact +10% uniform master speedup
+TTS_RATE="+8%"
+FINAL_SPEED=1.10
+MAX_ATEMPO=1.12
+VIDEO_CRF="27"
+VIDEO_PRESET="veryfast"
+AUDIO_BITRATE="128k"
+SILENCE_THRESHOLD=-42
+SAFETY_GAP=0.04
+MAX_SENTENCE=8.0
+FREEZE_ENABLED=True
+WHISPER_MODEL="tiny"
 
-# 2. Timing Controls
-ENABLE_FREEZE = True
-SAFETY_GAP = 0.03
-SILENCE_THRESHOLD = -42
-WHISPER_MODEL = "tiny"
-
-# 3. Quality & Bitrate Controls (Crisp 1080p/720p with compact 12-16 MB size)
-FINAL_CRF = "22"           # Visually crisp, studio-grade quality
-MAX_VIDEO_BITRATE = "2200k"# Bitrate ceiling (prevents size explosion)
-BUFFER_SIZE = "4400k"
-AUDIO_BITRATE = "128k"     # Clean, clear narration audio
-
-VOICE_MAP = {
-    "hi": "hi-IN-MadhurNeural",
-    "bn": "bn-IN-BashkarNeural",
-    "ta": "ta-IN-ValluvarNeural",
-    "te": "te-IN-MohanNeural",
-    "mr": "mr-IN-ManoharNeural",
-    "gu": "gu-IN-DhwaniNeural",
-    "kn": "kn-IN-GaganNeural",
-    "ml": "ml-IN-MidhunNeural",
-    "pa": "pa-IN-OjasNeural",
-    "en": "en-US-GuyNeural",
-    "fr": "fr-FR-HenriNeural",
-    "de": "de-DE-ConradNeural",
-    "es": "es-ES-AlvaroNeural",
-    "it": "it-IT-DiegoNeural",
-    "pt": "pt-BR-AntonioNeural",
-    "nl": "nl-NL-MaartenNeural",
-    "pl": "pl-PL-MarekNeural",
-    "tr": "tr-TR-AhmetNeural",
-    "ru": "ru-RU-DmitryNeural",
-    "uk": "uk-UA-OstapNeural",
-    "ja": "ja-JP-KeitaNeural",
-    "ko": "ko-KR-InJoonNeural",
-    "zh": "zh-CN-YunxiNeural",
-    "ar": "ar-SA-HamedNeural"
+VOICE_MAP={
+    "hi":"hi-IN-MadhurNeural",
+    "bn":"bn-IN-BashkarNeural",
+    "ta":"ta-IN-ValluvarNeural",
+    "te":"te-IN-MohanNeural",
+    "mr":"mr-IN-ManoharNeural",
+    "gu":"gu-IN-DhwaniNeural",
+    "kn":"kn-IN-GaganNeural",
+    "ml":"ml-IN-MidhunNeural",
+    "pa":"pa-IN-OjasNeural",
+    "en":"en-US-GuyNeural",
+    "fr":"fr-FR-HenriNeural",
+    "de":"de-DE-ConradNeural",
+    "es":"es-ES-AlvaroNeural",
+    "it":"it-IT-DiegoNeural",
+    "pt":"pt-BR-AntonioNeural",
+    "nl":"nl-NL-MaartenNeural",
+    "pl":"pl-PL-MarekNeural",
+    "tr":"tr-TR-AhmetNeural",
+    "ru":"ru-RU-DmitryNeural",
+    "uk":"uk-UA-OstapNeural",
+    "ja":"ja-JP-KeitaNeural",
+    "ko":"ko-KR-InJoonNeural",
+    "zh":"zh-CN-YunxiNeural",
+    "ar":"ar-SA-HamedNeural"
 }
 
-# ================= UTILITIES =================
+# ================= FFMPEG =================
 
-def run_command(cmd, quiet=False):
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.DEVNULL if quiet else None,
-        stderr=subprocess.DEVNULL if quiet else None,
-        check=True
-    )
+def run(cmd,quiet=False):
+    if quiet:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+    else:
+        subprocess.run(cmd,check=True)
 
-def get_duration(path):
-    result = subprocess.check_output([
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+def duration(path):
+    return float(subprocess.check_output([
+        "ffprobe","-v","error",
+        "-show_entries","format=duration",
+        "-of","default=noprint_wrappers=1:nokey=1",
         path
-    ])
-    return float(result.strip())
+    ]).strip())
 
 # ================= DOWNLOAD =================
 
 def download_media(url):
-    video_path = "raw_source.mp4"
-    audio_path = "input_audio.wav"
+    video="raw_source.mp4"
+    audio="input_audio.wav"
 
-    for path in (video_path, audio_path):
-        if os.path.exists(path):
+    for p in (video,audio):
+        if os.path.exists(p):
             try:
-                os.remove(path)
-            except OSError:
+                os.remove(p)
+            except:
                 pass
 
-    opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "outtmpl": video_path,
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True
+    print("📥 Downloading media...")
+
+    opts={
+        "format":"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "outtmpl":video,
+        "merge_output_format":"mp4",
+        "quiet":True,
+        "no_warnings":True
     }
 
-    print("📥 Downloading media...")
     with yt_dlp.YoutubeDL(opts) as ydl:
-        meta = ydl.extract_info(url, download=True)
-        metadata = {
-            "title": meta.get("title", "Dubbed Video"),
-            "description": meta.get("description", ""),
-            "tags": meta.get("tags", [])
-        }
+        info=ydl.extract_info(url,download=True)
 
-    with open("source_meta.json", "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    meta={
+        "title":info.get("title","Dubbed Video"),
+        "description":info.get("description",""),
+        "tags":info.get("tags",[])
+    }
 
-    print(f"TITLE_EMIT: {metadata['title']}")
-    print("🎵 Extracting source audio...")
+    with open(
+        "source_meta.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            meta,
+            f,
+            ensure_ascii=False
+        )
 
-    run_command([
-        "ffmpeg", "-y", "-err_detect", "ignore_err",
-        "-i", video_path,
+    print(f"TITLE_EMIT: {meta['title']}")
+    print("🎵 Extracting audio...")
+
+    run([
+        "ffmpeg","-y",
+        "-i",video,
         "-vn",
-        "-acodec", "pcm_s16le",
-        "-ar", "16000",
-        "-ac", "1",
-        audio_path
-    ], quiet=True)
+        "-ac","1",
+        "-ar","16000",
+        "-c:a","pcm_s16le",
+        audio
+    ],True)
 
-    return video_path, audio_path, metadata
+    return video,audio,meta
 
 # ================= TRANSLATION =================
 
 def contains_devanagari(text):
-    return bool(re.search(r"[\u0900-\u097F]", text))
+    return bool(
+        re.search(
+            r"[\u0900-\u097F]",
+            text
+        )
+    )
 
-def is_error_page(text):
-    t = text.lower()
+def bad_translation(text):
+    if not text:
+        return True
+
+    t=text.lower()
+
     return any(x in t for x in (
-        "server error", "500", "!!1500", "<!doctype", "<html", "captcha", "unusual traffic"
+        "<html",
+        "<!doctype",
+        "server error",
+        "captcha",
+        "unusual traffic"
     ))
 
-def translate_text(text, target_lang):
-    text = re.sub(r"[\r\n\t]+", " ", text).strip()
-    if not text or len(text) < 2:
+def translate_hindi(text):
+    text=re.sub(
+        r"[\r\n\t]+",
+        " ",
+        text
+    ).strip()
+
+    if len(text)<2:
         return text
-
-    if target_lang == "hi":
-        for _ in range(3):
-            try:
-                result = GoogleTranslator(source="auto", target="hi").translate(text)
-                if result and not is_error_page(result) and contains_devanagari(result):
-                    return result.strip()
-            except Exception:
-                time.sleep(0.2)
-
-        try:
-            result = MyMemoryTranslator(source="auto", target="hi-IN").translate(text)
-            if result and not is_error_page(result) and contains_devanagari(result):
-                return result.strip()
-        except Exception:
-            pass
-        return ""
 
     for _ in range(3):
         try:
-            result = GoogleTranslator(source="auto", target=target_lang).translate(text)
-            if result and not is_error_page(result):
+            result=GoogleTranslator(
+                source="auto",
+                target="hi"
+            ).translate(text)
+
+            if (
+                result
+                and not bad_translation(result)
+                and contains_devanagari(result)
+            ):
                 return result.strip()
-        except Exception:
-            time.sleep(0.2)
+
+        except:
+            time.sleep(.25)
+
+    try:
+        result=MyMemoryTranslator(
+            source="auto",
+            target="hi-IN"
+        ).translate(text)
+
+        if (
+            result
+            and not bad_translation(result)
+            and contains_devanagari(result)
+        ):
+            return result.strip()
+
+    except:
+        pass
+
+    return ""
+
+def translate(text,target):
+    if target=="hi":
+        return translate_hindi(text)
+
+    text=re.sub(
+        r"[\r\n\t]+",
+        " ",
+        text
+    ).strip()
+
+    if len(text)<2:
+        return text
+
+    for _ in range(3):
+        try:
+            result=GoogleTranslator(
+                source="auto",
+                target=target
+            ).translate(text)
+
+            if result and not bad_translation(result):
+                return result.strip()
+
+        except:
+            time.sleep(.25)
 
     return text
 
 # ================= WHISPER =================
 
-def transcribe_and_translate(audio_path, target_lang):
+def transcribe_and_translate(
+    audio_path,
+    target_lang="hi"
+):
     print("🧠 Loading Whisper...")
-    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 
-    print("🎙️ Transcribing source audio...")
-    raw_segments, info = model.transcribe(
+    model=WhisperModel(
+        WHISPER_MODEL,
+        device="cpu",
+        compute_type="int8"
+    )
+
+    print("🎙️ Transcribing...")
+
+    raw_segments,info=model.transcribe(
         audio_path,
         language=None,
         vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 350}
+        vad_parameters={
+            "min_silence_duration_ms":350
+        }
     )
-    print(f"🌍 Detected source language: {info.language}")
 
-    raw = []
-    for segment in raw_segments:
-        text = segment.text.strip()
-        if not text or (segment.end - segment.start < 0.15):
+    print(
+        f"🌍 Detected language: {info.language}"
+    )
+
+    raw=[]
+
+    for s in raw_segments:
+        text=s.text.strip()
+
+        if not text:
             continue
+
+        if s.end-s.start<.2:
+            continue
+
         raw.append({
-            "start": float(segment.start),
-            "end": float(segment.end),
-            "text": text
+            "start":float(s.start),
+            "end":float(s.end),
+            "text":text
         })
 
     if not raw:
         return []
 
-    print(f"📝 Whisper found {len(raw)} speech segments.")
-    segments = []
+    # ---------- semantic grouping ----------
 
-    for i, source in enumerate(raw):
-        start = source["start"]
-        if i + 1 < len(raw):
-            source_slot = raw[i + 1]["start"] - start - SAFETY_GAP
+    blocks=[]
+    current=[]
+    current_start=raw[0]["start"]
+    current_end=raw[0]["end"]
+
+    endings=(
+        ".",
+        "!",
+        "?",
+        "।",
+        "…"
+    )
+
+    for i,s in enumerate(raw):
+        current.append(s["text"])
+        current_end=s["end"]
+
+        terminal=s["text"].rstrip().endswith(
+            endings
+        )
+
+        acoustic_gap=False
+
+        if i+1<len(raw):
+            gap=raw[i+1]["start"]-s["end"]
+            acoustic_gap=gap>=.8
+
+        too_long=(
+            current_end-current_start
+            >=MAX_SENTENCE
+        )
+
+        last=i+1==len(raw)
+
+        if (
+            terminal
+            or acoustic_gap
+            or too_long
+            or last
+        ):
+            text=" ".join(current).strip()
+
+            if text:
+                blocks.append({
+                    "start":current_start,
+                    "end":current_end,
+                    "text":text
+                })
+
+            current=[]
+
+            if i+1<len(raw):
+                current_start=raw[i+1]["start"]
+
+    print(
+        f"📝 {len(blocks)} semantic sentences."
+    )
+
+    segments=[]
+
+    preview=False
+
+    for i,b in enumerate(blocks):
+
+        if i+1<len(blocks):
+            next_start=blocks[i+1]["start"]
+
+            available=max(
+                .5,
+                next_start-b["start"]-SAFETY_GAP
+            )
         else:
-            source_slot = source["end"] - start + 2.0
+            available=max(
+                .5,
+                b["end"]-b["start"]+2
+            )
 
-        source_slot = max(0.25, source_slot)
-        translated = translate_text(source["text"], target_lang)
+        translated=translate(
+            b["text"],
+            target_lang
+        )
 
-        if not translated and target_lang != "hi":
-            translated = source["text"]
+        if not translated:
+            translated=b["text"]
 
-        if i == 0:
-            print("TRANSLATION_PREVIEW: " + translated[:120])
+        if not preview:
+            print(
+                "TRANSLATION_PREVIEW: "
+                +translated[:120]
+            )
+            preview=True
 
         segments.append({
-            "index": i,
-            "start": start,
-            "source_end": source["end"],
-            "source_slot": source_slot,
-            "source_text": source["text"],
-            "translated_text": translated,
-            "target_lang": target_lang
+            "index":i,
+            "start":b["start"],
+            "end":b["end"],
+            "available_slot":available,
+            "translated_text":translated,
+            "target_lang":target_lang
         })
 
     return segments
 
-# ================= FAST PARALLEL TTS =================
+# ================= SILENCE =================
 
-def strip_dead_silence(input_file, output_file):
-    audio = AudioSegment.from_file(input_file)
-    if len(audio) == 0:
+def strip_dead_silence(
+    source,
+    output,
+    threshold=SILENCE_THRESHOLD
+):
+    audio=AudioSegment.from_file(source)
+
+    if not audio:
         return
 
-    start_trim = 0
-    end_trim = len(audio)
+    start=0
+    end=len(audio)
 
-    for pos in range(0, len(audio), 10):
-        if audio[pos:pos + 10].dBFS > SILENCE_THRESHOLD:
-            start_trim = max(0, pos - 20)
+    step=10
+
+    for p in range(
+        0,
+        len(audio),
+        step
+    ):
+        chunk=audio[p:p+step]
+
+        if chunk.dBFS>threshold:
+            start=max(
+                0,
+                p-15
+            )
             break
 
-    for pos in range(len(audio) - 10, 0, -10):
-        if audio[pos:pos + 10].dBFS > SILENCE_THRESHOLD:
-            end_trim = min(len(audio), pos + 30)
+    for p in range(
+        len(audio)-step,
+        0,
+        -step
+    ):
+        chunk=audio[p:p+step]
+
+        if chunk.dBFS>threshold:
+            end=min(
+                len(audio),
+                p+step+15
+            )
             break
 
-    stripped = audio if end_trim <= start_trim else audio[start_trim:end_trim]
-    stripped = stripped.set_frame_rate(44100).set_channels(2)
-    stripped.export(output_file, format="wav")
+    audio=audio[start:end]
 
-async def synthesize_audio(segments, temp_dir="temp_audio"):
+    audio=(
+        audio
+        .set_frame_rate(44100)
+        .set_channels(2)
+    )
+
+    audio.export(
+        output,
+        format="wav"
+    )
+
+# ================= TTS =================
+
+async def generate_tts(
+    text,
+    voice,
+    output
+):
+    communicate=edge_tts.Communicate(
+        text,
+        voice,
+        rate=TTS_RATE
+    )
+
+    await communicate.save(output)
+
+def change_speed(
+    source,
+    output,
+    factor
+):
+    run([
+        "ffmpeg","-y",
+        "-i",source,
+        "-filter:a",
+        f"atempo={factor:.5f}",
+        "-ar","44100",
+        "-ac","2",
+        output
+    ],True)
+
+async def synthesize_audio(
+    segments,
+    temp_dir="temp_audio"
+):
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir, exist_ok=True)
 
-    print(f"🔊 Synthesizing {len(segments)} TTS clips in parallel at {TTS_RATE}...")
-    sem = asyncio.Semaphore(5)
+    os.makedirs(temp_dir)
 
-    async def fetch_one(i, seg):
-        text = seg.get("translated_text", "").strip()
+    for i,seg in enumerate(segments):
+
+        text=seg[
+            "translated_text"
+        ].strip()
+
         if not text:
-            seg["clip_file"] = None
-            seg["tts_duration"] = 0
-            return
+            seg["clip_file"]=None
+            seg["tts_duration"]=0
+            continue
 
-        target_lang = seg.get("target_lang", "hi").lower()
-        base_lang = target_lang.split("-")[0]
-        voice = VOICE_MAP.get(base_lang, "en-US-GuyNeural")
+        lang=(
+            seg.get(
+                "target_lang",
+                "hi"
+            )
+            .lower()
+            .split("-")[0]
+        )
 
-        raw_file = os.path.join(temp_dir, f"raw_{i}.mp3")
-        stripped_file = os.path.join(temp_dir, f"strip_{i}.wav")
+        voice=VOICE_MAP.get(
+            lang,
+            "en-US-GuyNeural"
+        )
 
-        async with sem:
-            for attempt in range(3):
-                try:
-                    communicator = edge_tts.Communicate(text, voice, rate=TTS_RATE)
-                    await communicator.save(raw_file)
-                    break
-                except Exception as e:
-                    if attempt == 2:
-                        print(f"⚠️ TTS error on segment {i}: {e}")
-                        seg["clip_file"] = None
-                        seg["tts_duration"] = 0
-                        return
-                    await asyncio.sleep(0.4)
+        raw=os.path.join(
+            temp_dir,
+            f"raw_{i}.mp3"
+        )
 
-        strip_dead_silence(raw_file, stripped_file)
-        duration = get_duration(stripped_file)
-        seg["clip_file"] = stripped_file
-        seg["tts_duration"] = duration
+        clean=os.path.join(
+            temp_dir,
+            f"clean_{i}.wav"
+        )
 
-    tasks = [fetch_one(i, seg) for i, seg in enumerate(segments)]
-    await asyncio.gather(*tasks)
+        fitted=os.path.join(
+            temp_dir,
+            f"fit_{i}.wav"
+        )
+
+        print(
+            f"🔊 TTS {i+1}/{len(segments)}"
+        )
+
+        try:
+            await generate_tts(
+                text,
+                voice,
+                raw
+            )
+
+            strip_dead_silence(
+                raw,
+                clean
+            )
+
+            original_duration=duration(
+                clean
+            )
+
+            available=seg[
+                "available_slot"
+            ]
+
+            ratio=(
+                original_duration
+                /available
+            )
+
+            # Never make speech excessively fast.
+            if ratio>1.0:
+
+                factor=min(
+                    ratio,
+                    MAX_ATEMPO
+                )
+
+                change_speed(
+                    clean,
+                    fitted,
+                    factor
+                )
+
+                final_file=fitted
+                final_duration=(
+                    original_duration
+                    /factor
+                )
+
+                seg["audio_speed"]=factor
+
+            else:
+                final_file=clean
+                final_duration=original_duration
+                seg["audio_speed"]=1.0
+
+            seg["clip_file"]=final_file
+            seg["tts_duration"]=final_duration
+
+            print(
+                f"   original={original_duration:.2f}s "
+                f"final={final_duration:.2f}s "
+                f"speed={seg['audio_speed']:.3f}x"
+            )
+
+        except Exception as e:
+            print(
+                f"⚠️ TTS error {i}: {e}"
+            )
+
+            seg["clip_file"]=None
+            seg["tts_duration"]=0
 
 # ================= TIMELINE =================
 
-def calculate_dub_timeline(segments):
-    current_time = 0.0
+def build_timeline(segments):
+    cursor=0.0
 
-    for i, seg in enumerate(segments):
-        original_start = seg["start"]
-        original_slot = seg["source_slot"]
-        tts_duration = seg.get("tts_duration", 0)
+    for i,seg in enumerate(segments):
 
-        new_start = original_start if i == 0 else current_time
-        speech_end = new_start + tts_duration
-        original_end = original_start + original_slot
+        original_start=seg["start"]
+        available=seg["available_slot"]
+        speech=seg["tts_duration"]
 
-        visual_end = max(new_start + original_slot, speech_end)
-        freeze_duration = max(0.0, speech_end - (new_start + original_slot))
+        # Normally anchor to source position.
+        # After a freeze, never move backwards.
+        start=max(
+            original_start,
+            cursor
+        )
 
-        seg["new_start"] = new_start
-        seg["speech_end"] = speech_end
-        seg["original_visual_end"] = original_end
-        seg["visual_end"] = visual_end
-        seg["freeze_duration"] = freeze_duration
+        speech_end=start+speech
 
-        current_time = visual_end
+        normal_end=start+available
+
+        freeze=max(
+            0.0,
+            speech_end-normal_end
+        )
+
+        if not FREEZE_ENABLED:
+            freeze=0.0
+
+        visual_end=(
+            normal_end+freeze
+            if freeze>0
+            else normal_end
+        )
+
+        visual_end=max(
+            visual_end,
+            speech_end
+        )
+
+        seg["final_start"]=start
+        seg["speech_end"]=speech_end
+        seg["freeze_duration"]=freeze
+        seg["visual_end"]=visual_end
+
+        cursor=visual_end
+
+        print(
+            f"⏱ {i+1}: "
+            f"start={start:.2f} "
+            f"speech={speech:.2f} "
+            f"slot={available:.2f} "
+            f"freeze={freeze:.2f} "
+            f"next={cursor:.2f}"
+        )
 
     return segments
 
 # ================= MASTER AUDIO =================
 
-def build_master_audio(segments, total_duration, output_file):
-    print("🎧 Building dubbed audio timeline...")
-    master = AudioSegment.silent(
-        duration=int((total_duration + 0.5) * 1000),
+def create_master_audio(
+    segments,
+    total_duration,
+    output
+):
+    print("🎧 Building synchronized audio...")
+
+    master=AudioSegment.silent(
+        duration=int(
+            (total_duration+.5)*1000
+        ),
         frame_rate=44100
     ).set_channels(2)
 
     for seg in segments:
-        clip_file = seg.get("clip_file")
-        if not clip_file or not os.path.exists(clip_file):
+
+        clip_file=seg.get(
+            "clip_file"
+        )
+
+        if (
+            not clip_file
+            or not os.path.exists(clip_file)
+        ):
             continue
 
-        clip = AudioSegment.from_file(clip_file).set_frame_rate(44100).set_channels(2)
-        master = master.overlay(clip, position=int(seg["new_start"] * 1000))
+        clip=(
+            AudioSegment
+            .from_file(clip_file)
+            .set_frame_rate(44100)
+            .set_channels(2)
+        )
 
-        seg["final_start"] = seg["new_start"]
-        seg["final_end"] = seg["speech_end"]
+        position=int(
+            seg["final_start"]*1000
+        )
 
-    master.export(output_file, format="wav")
-    return output_file
+        master=master.overlay(
+            clip,
+            position=position
+        )
 
-# ================= HIGH-SPEED LOSSLESS SLICING =================
+    master.export(
+        output,
+        format="wav"
+    )
 
-def create_video_part(video_file, source_start, source_end, freeze_duration, output_file):
-    duration = source_end - source_start
-    if duration <= 0:
-        return False
+# ================= ONE-PASS VIDEO =================
 
-    filters = [
-        f"trim=start={source_start:.6f}:end={source_end:.6f}",
-        "setpts=PTS-STARTPTS"
-    ]
+def render_video(
+    source,
+    segments,
+    output
+):
+    source_duration=duration(source)
 
-    if ENABLE_FREEZE and freeze_duration > 0.01:
-        filters.append(f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f}")
+    print(
+        "🎬 Rendering synchronized video "
+        "in ONE encode..."
+    )
 
-    # CRF 17 preserves near-lossless clarity during fast intermediate cuts
-    cmd = [
-        "ffmpeg", "-y", "-err_detect", "ignore_err",
-        "-i", video_file,
+    filters=[]
+    labels=[]
+
+    # ---------- opening ----------
+    first_start=segments[0]["start"]
+
+    if first_start>.01:
+
+        filters.append(
+            "[0:v]"
+            f"trim=start=0:end={first_start:.6f},"
+            "setpts=PTS-STARTPTS"
+            "[v0]"
+        )
+
+        labels.append("[v0]")
+
+    label_number=1
+
+    # ---------- sentence video ----------
+    for i,seg in enumerate(segments):
+
+        start=seg["start"]
+
+        if i+1<len(segments):
+            end=segments[i+1]["start"]
+        else:
+            end=source_duration
+
+        end=min(
+            end,
+            source_duration
+        )
+
+        if end<=start:
+            continue
+
+        label=f"v{label_number}"
+
+        part=(
+            "[0:v]"
+            f"trim=start={start:.6f}:end={end:.6f},"
+            "setpts=PTS-STARTPTS"
+        )
+
+        freeze=seg.get(
+            "freeze_duration",
+            0
+        )
+
+        if (
+            FREEZE_ENABLED
+            and freeze>.01
+        ):
+            part+=(
+                ",tpad="
+                "stop_mode=clone:"
+                f"stop_duration={freeze:.6f}"
+            )
+
+        part+=f"[{label}]"
+
+        filters.append(part)
+        labels.append(f"[{label}]")
+
+        label_number+=1
+
+    if not labels:
+        raise RuntimeError(
+            "No video segments available."
+        )
+
+    joined="".join(labels)
+
+    filters.append(
+        f"{joined}"
+        f"concat=n={len(labels)}:v=1:a=0,"
+        "format=yuv420p[v]"
+    )
+
+    # IMPORTANT:
+    # Apply the 10% speed increase HERE,
+    # during the SAME video encode.
+    filters.append(
+        f"[v]setpts=PTS/{FINAL_SPEED:.5f}[vout]"
+    )
+
+    filter_complex=";".join(filters)
+
+    run([
+        "ffmpeg","-y",
+        "-i",source,
+        "-filter_complex",filter_complex,
+        "-map","[vout]",
         "-an",
-        "-vf", ",".join(filters),
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "17",
-        "-pix_fmt", "yuv420p",
-        "-r", "30",
-        output_file
-    ]
-    run_command(cmd, quiet=True)
-    return True
-
-def concatenate_video_parts(parts, output_file):
-    concat_file = "video_concat.txt"
-    with open(concat_file, "w", encoding="utf-8") as f:
-        for part in parts:
-            absolute = os.path.abspath(part).replace("\\", "/").replace("'", "'\\''")
-            f.write(f"file '{absolute}'\n")
-
-    # Fast stream copy without generation loss
-    run_command([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concat_file,
-        "-c:v", "copy",
-        output_file
-    ], quiet=True)
-
-    if os.path.exists(concat_file):
-        os.remove(concat_file)
-
-def build_extended_video(video_file, segments, output_file):
-    source_duration = get_duration(video_file)
-    print("🎬 Slicing & freezing video parts (High-Fidelity Mode)...")
-
-    temp_dir = "temp_video_parts"
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-    os.makedirs(temp_dir)
-
-    parts = []
-
-    for i, seg in enumerate(segments):
-        source_start = seg["start"]
-        if i == 0 and source_start > 0.01:
-            opening = os.path.join(temp_dir, "part_000_opening.mp4")
-            create_video_part(video_file, 0, source_start, 0, opening)
-            parts.append(opening)
-
-        source_end = segments[i + 1]["start"] if (i + 1 < len(segments)) else source_duration
-        source_end = min(source_end, source_duration)
-        if source_end <= source_start:
-            continue
-
-        freeze_duration = seg.get("freeze_duration", 0)
-        part_file = os.path.join(temp_dir, f"part_{i+1:04d}.mp4")
-        create_video_part(video_file, source_start, source_end, freeze_duration, part_file)
-        parts.append(part_file)
-
-    if not parts:
-        raise RuntimeError("No video parts created.")
-
-    concatenate_video_parts(parts, output_file)
-    return output_file
-
-# ================= FINAL MUX & MASTER SPEEDUP =================
-
-def mux_final_video(extended_video, dubbed_audio, output_file):
-    pct = int(round((FINAL_SPEED - 1.0) * 100))
-    print(f"🎬 Final mux: +{pct}% speedup @ CRF {FINAL_CRF} (Max: {MAX_VIDEO_BITRATE})...")
-
-    video_filter = f"setpts=PTS/{FINAL_SPEED:.4f},fps=30"
-    audio_filter = f"atempo={FINAL_SPEED:.4f}"
-
-    # Controlled CRF encoding: pristine details while capping maximum spikes
-    run_command([
-        "ffmpeg", "-y",
-        "-i", extended_video,
-        "-i", dubbed_audio,
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-vf", video_filter,
-        "-af", audio_filter,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", FINAL_CRF,
-        "-maxrate", MAX_VIDEO_BITRATE,
-        "-bufsize", BUFFER_SIZE,
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-b:a", AUDIO_BITRATE,
-        "-movflags", "+faststart",
-        "-map_metadata", "-1",
-        "-map_chapters", "-1",
-        output_file
+        "-c:v","libx264",
+        "-preset",VIDEO_PRESET,
+        "-crf",VIDEO_CRF,
+        "-pix_fmt","yuv420p",
+        "-movflags","+faststart",
+        output
     ])
 
-# ================= SRT SUBTITLES =================
+# ================= FINAL MUX =================
 
-def format_timestamp(seconds):
-    seconds = max(0.0, seconds)
-    total_ms = int(round(seconds * 1000))
-    hours = total_ms // 3600000
-    total_ms %= 3600000
-    minutes = total_ms // 60000
-    total_ms %= 60000
-    secs = total_ms // 1000
-    millis = total_ms % 1000
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+def mux_audio(
+    video,
+    audio,
+    output
+):
+    print("🎧 Encoding audio and muxing...")
 
-def generate_srt(segments, output_file="subtitles.srt"):
-    print("📝 Creating synchronized subtitles...")
-    with open(output_file, "w", encoding="utf-8") as f:
-        index = 1
+    # Audio gets the exact same 10% speed change
+    # as the video.
+    audio_filter=f"atempo={FINAL_SPEED:.5f}"
+
+    run([
+        "ffmpeg","-y",
+        "-i",video,
+        "-i",audio,
+        "-map","0:v:0",
+        "-map","1:a:0",
+        "-af",audio_filter,
+        "-c:v","copy",
+        "-c:a","aac",
+        "-b:a",AUDIO_BITRATE,
+        "-movflags","+faststart",
+        "-map_metadata","-1",
+        "-map_chapters","-1",
+        "-shortest",
+        output
+    ])
+
+# ================= SRT =================
+
+def timestamp(seconds):
+    ms=int(
+        round(
+            max(0,seconds)*1000
+        )
+    )
+
+    h=ms//3600000
+    ms%=3600000
+
+    m=ms//60000
+    ms%=60000
+
+    s=ms//1000
+    ms%=1000
+
+    return (
+        f"{h:02d}:"
+        f"{m:02d}:"
+        f"{s:02d},"
+        f"{ms:03d}"
+    )
+
+def generate_srt(
+    segments,
+    output="subtitles.srt"
+):
+    print("📝 Creating subtitles...")
+
+    with open(
+        output,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        index=1
+
         for seg in segments:
-            text = seg.get("translated_text", "").strip()
+
+            text=seg[
+                "translated_text"
+            ].strip()
+
             if not text:
                 continue
 
-            start = seg.get("final_start", seg["new_start"]) / FINAL_SPEED
-            end = seg.get("final_end", seg["speech_end"]) / FINAL_SPEED
+            start=(
+                seg["final_start"]
+                /FINAL_SPEED
+            )
 
-            if end <= start:
-                end = start + 0.5
+            end=(
+                seg["speech_end"]
+                /FINAL_SPEED
+            )
 
-            f.write(f"{index}\n{format_timestamp(start)} --> {format_timestamp(end)}\n{text}\n\n")
-            index += 1
+            if end<=start:
+                end=start+.5
+
+            f.write(
+                f"{index}\n"
+                f"{timestamp(start)} --> "
+                f"{timestamp(end)}\n"
+                f"{text}\n\n"
+            )
+
+            index+=1
 
 # ================= CLEANUP =================
 
 def cleanup():
-    for directory in ("temp_audio", "temp_video_parts"):
+
+    for directory in (
+        "temp_audio",
+    ):
         if os.path.exists(directory):
             try:
                 shutil.rmtree(directory)
-            except Exception:
+            except:
                 pass
 
-    for file in ("raw_source.mp4", "input_audio.wav", "synced_master.wav", "extended_video.mp4", "video_concat.txt"):
+    for file in (
+        "raw_source.mp4",
+        "input_audio.wav",
+        "synced_master.wav",
+        "extended_video.mp4"
+    ):
         if os.path.exists(file):
             try:
                 os.remove(file)
-            except Exception:
+            except:
                 pass
 
 # ================= MAIN =================
 
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print('Usage: python dub.py "VIDEO_URL" [target_language]')
+if __name__=="__main__":
+
+    if len(sys.argv)<2:
+        print(
+            'Usage: python dubber.py "VIDEO_URL" [language]'
+        )
+        print(
+            'Example: python dubber.py "https://..." hi'
+        )
         sys.exit(1)
 
-    video_url = sys.argv[1]
-    target_language = (sys.argv[2] if len(sys.argv) > 2 else "hi").lower()
+    url=sys.argv[1]
+
+    target=(
+        sys.argv[2]
+        if len(sys.argv)>2
+        else "hi"
+    ).lower()
 
     print()
-    print("=" * 55)
-    print("AI DUBBING ENGINE (STUDIO QUALITY & COMPACT)")
-    print("=" * 55)
-    print(f"Target language : {target_language}")
-    print(f"TTS Speech rate : {TTS_RATE}")
-    print(f"Master speedup  : {FINAL_SPEED}x (+{int(round((FINAL_SPEED - 1.0) * 100))}%)")
-    print(f"Video Quality   : CRF {FINAL_CRF}")
-    print("=" * 55)
+    print("="*60)
+    print("AI DUBBER - OPTIMIZED SYNCHRONIZATION")
+    print("="*60)
+    print(
+        f"Target language : {target}"
+    )
+    print(
+        f"TTS rate        : {TTS_RATE}"
+    )
+    print(
+        f"Max TTS stretch : {MAX_ATEMPO}x"
+    )
+    print(
+        f"Final speed     : {FINAL_SPEED}x"
+    )
+    print(
+        f"Video CRF       : {VIDEO_CRF}"
+    )
+    print(
+        f"Video preset    : {VIDEO_PRESET}"
+    )
+    print(
+        f"Audio bitrate   : {AUDIO_BITRATE}"
+    )
+    print(
+        f"Freeze frames   : {FREEZE_ENABLED}"
+    )
+    print("="*60)
     print()
 
-    t_start = time.time()
+    started=time.time()
 
     try:
-        video_file, audio_file, metadata = download_media(video_url)
 
-        segments = transcribe_and_translate(audio_file, target_language)
-        if not segments:
-            raise RuntimeError("No speech segments detected.")
-
-        asyncio.run(synthesize_audio(segments))
-        calculate_dub_timeline(segments)
-
-        final_duration = max(
-            get_duration(video_file),
-            max((seg["visual_end"] for seg in segments), default=0.0)
+        # 1. Download
+        video,audio,meta=download_media(
+            url
         )
 
-        master_audio = "synced_master.wav"
-        build_master_audio(segments, final_duration, master_audio)
+        source_duration=duration(
+            video
+        )
 
-        extended_video = "extended_video.mp4"
-        build_extended_video(video_file, segments, extended_video)
+        source_size=(
+            os.path.getsize(video)
+            /1048576
+        )
 
-        mux_final_video(extended_video, master_audio, "final_output.mp4")
-        generate_srt(segments, "subtitles.srt")
+        print(
+            f"📦 Source: "
+            f"{source_size:.2f} MB | "
+            f"{source_duration:.2f}s"
+        )
 
-        orig_dur = get_duration(video_file)
-        final_dur = get_duration("final_output.mp4")
-        orig_mb = os.path.getsize(video_file) / (1024 * 1024)
-        final_mb = os.path.getsize("final_output.mp4") / (1024 * 1024)
-        total_time = time.time() - t_start
+        # 2. Whisper + translation
+        segments=(
+            transcribe_and_translate(
+                audio,
+                target
+            )
+        )
+
+        if not segments:
+            raise RuntimeError(
+                "No speech segments detected."
+            )
+
+        # 3. TTS
+        asyncio.run(
+            synthesize_audio(
+                segments
+            )
+        )
+
+        # 4. Build non-colliding timeline
+        build_timeline(
+            segments
+        )
+
+        timeline_duration=max(
+            source_duration,
+            max(
+                (
+                    s["visual_end"]
+                    for s in segments
+                ),
+                default=0
+            )
+        )
+
+        print(
+            f"📏 Timeline duration: "
+            f"{timeline_duration:.2f}s"
+        )
+
+        # 5. Master audio
+        master_audio="synced_master.wav"
+
+        create_master_audio(
+            segments,
+            timeline_duration,
+            master_audio
+        )
+
+        # 6. ONE video encode
+        intermediate_video=(
+            "extended_video.mp4"
+        )
+
+        render_video(
+            video,
+            segments,
+            intermediate_video
+        )
+
+        # 7. Final audio mux.
+        # Video is COPIED here, not encoded again.
+        mux_audio(
+            intermediate_video,
+            master_audio,
+            "final_output.mp4"
+        )
+
+        # 8. Subtitles
+        generate_srt(
+            segments,
+            "subtitles.srt"
+        )
+
+        # 9. Results
+        final_size=(
+            os.path.getsize(
+                "final_output.mp4"
+            )/1048576
+        )
+
+        final_duration=duration(
+            "final_output.mp4"
+        )
+
+        elapsed=(
+            time.time()-started
+        )
 
         print()
-        print("=" * 55)
+        print("="*60)
         print("✅ DUBBING COMPLETE")
-        print("=" * 55)
-        print(f"Execution time    : {total_time:.1f}s (~{total_time/60:.1f} min)")
-        print(f"Original size     : {orig_mb:.2f} MB")
-        print(f"Final size        : {final_mb:.2f} MB (High-Quality)")
-        print(f"Original duration : {orig_dur:.2f}s")
-        print(f"Final duration    : {final_dur:.2f}s")
-        print("=" * 55)
+        print("="*60)
+        print(
+            f"Source size     : "
+            f"{source_size:.2f} MB"
+        )
+        print(
+            f"Final size      : "
+            f"{final_size:.2f} MB"
+        )
+        print(
+            f"Source duration : "
+            f"{source_duration:.2f}s"
+        )
+        print(
+            f"Final duration  : "
+            f"{final_duration:.2f}s"
+        )
+        print(
+            f"Final speed     : "
+            f"{FINAL_SPEED}x"
+        )
+        print(
+            f"Processing time : "
+            f"{elapsed/60:.2f} minutes"
+        )
+        print()
+        print(
+            "🎬 final_output.mp4"
+        )
+        print(
+            "📝 subtitles.srt"
+        )
+        print("="*60)
 
         cleanup()
 
     except Exception as e:
+
         print()
-        print("=" * 55)
+        print("="*60)
         print("❌ DUBBING FAILED")
-        print(f"Error: {e}")
-        print("=" * 55)
+        print("="*60)
+        print(str(e))
+        print("="*60)
+
         raise
