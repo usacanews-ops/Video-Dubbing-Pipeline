@@ -287,8 +287,6 @@ fun DubberLiveApp() {
         mutableStateOf(prefs.getString("custom_tags", "#fyp #moviejet #reels #hindidubbed #movieexplained") ?: "")
     }
 
-    var scheduleMinutesText by remember { mutableStateOf("0") }
-
     var videoUrl by remember { mutableStateOf("") }
     var selectedLanguage by remember { mutableStateOf("hi") }
     var showSettings by remember { mutableStateOf(cloudServerKey.isBlank()) }
@@ -461,17 +459,6 @@ fun DubberLiveApp() {
             singleLine = true
         )
 
-        Spacer(modifier = Modifier.height(6.dp))
-
-        OutlinedTextField(
-            value = scheduleMinutesText,
-            onValueChange = { scheduleMinutesText = it.filter { ch -> ch.isDigit() } },
-            label = { Text("Schedule Upload (Minutes from now, 0 = Immediate)") },
-            placeholder = { Text("e.g. 30 (Min 20 mins for scheduler)") },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true
-        )
-
         Spacer(modifier = Modifier.height(8.dp))
 
         OutlinedTextField(
@@ -597,12 +584,15 @@ fun DubberLiveApp() {
 
             Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 DubberQueueManager.historyList.forEach { history ->
+                    // Local state for each card's schedule minutes
+                    var cardScheduleMinutes by remember { mutableStateOf("0") }
+
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            // Header Row: Source Title + Info Icon + '✕' Delete
+                            // Header: Clean Title + Info + Delete
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -680,7 +670,31 @@ fun DubberLiveApp() {
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            // Action Buttons Row: Watch | Copy | Open | Upload
+                            // Dedicated Schedule Input Box on this card
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text("🕒 Schedule (Mins):", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                OutlinedTextField(
+                                    value = cardScheduleMinutes,
+                                    onValueChange = { cardScheduleMinutes = it.filter { ch -> ch.isDigit() } },
+                                    placeholder = { Text("0 = Now", fontSize = 10.sp) },
+                                    modifier = Modifier.width(90.dp).height(44.dp),
+                                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp),
+                                    singleLine = true
+                                )
+                                Text(
+                                    text = if ((cardScheduleMinutes.toLongOrNull() ?: 0L) >= 20L) "Will schedule" else "Immediate",
+                                    fontSize = 10.sp,
+                                    color = if ((cardScheduleMinutes.toLongOrNull() ?: 0L) >= 20L) Color(0xFF1565C0) else Color.Gray
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Action Buttons: Watch | Copy | Open | Upload / Schedule
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -731,6 +745,9 @@ fun DubberLiveApp() {
                                     Text("↗", fontSize = 14.sp, fontWeight = FontWeight.Bold)
                                 }
 
+                                val schedMins = cardScheduleMinutes.toLongOrNull() ?: 0L
+                                val isScheduledMode = schedMins >= 20L
+
                                 Button(
                                     onClick = {
                                         val targetPage = selectedPageAccount
@@ -743,8 +760,7 @@ fun DubberLiveApp() {
                                             val finalTags = customTags.ifBlank { "#fyp #moviejet #reels #hindidubbed #movieexplained" }
                                             val finalCaption = "$finalTitle\n.\n.\n$finalTags"
 
-                                            val schedMins = scheduleMinutesText.toLongOrNull() ?: 0L
-                                            val scheduleUnix = if (schedMins >= 20L) {
+                                            val scheduleUnix = if (isScheduledMode) {
                                                 (System.currentTimeMillis() / 1000) + (schedMins * 60)
                                             } else null
 
@@ -765,7 +781,7 @@ fun DubberLiveApp() {
                                                         isUploadingToFb = false
                                                         history.isUploaded = true
                                                         DubberQueueManager.saveHistory(context)
-                                                        val msg = if (scheduleUnix != null) "📅 Scheduled successfully!" else "🎉 Published directly to FB!"
+                                                        val msg = if (scheduleUnix != null) "📅 Scheduled successfully for +$schedMins mins!" else "🎉 Published directly to FB!"
                                                         Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                                                     },
                                                     onError = { err ->
@@ -778,13 +794,16 @@ fun DubberLiveApp() {
                                     },
                                     modifier = Modifier.weight(1f).height(38.dp),
                                     colors = ButtonDefaults.buttonColors(
-                                        containerColor = if (history.isUploaded) Color(0xFFE65100) else Color(0xFF1877F2)
+                                        containerColor = when {
+                                            isScheduledMode -> Color(0xFF1565C0)
+                                            history.isUploaded -> Color(0xFFE65100)
+                                            else -> Color(0xFF1877F2)
+                                        }
                                     ),
                                     contentPadding = PaddingValues(horizontal = 6.dp)
                                 ) {
-                                    val schedMins = scheduleMinutesText.toLongOrNull() ?: 0L
                                     val btnLabel = when {
-                                        schedMins >= 20L -> "📅 Schedule"
+                                        isScheduledMode -> "📅 Schedule"
                                         history.isUploaded -> "🔄 Re-upload"
                                         else -> "🚀 Upload FB"
                                     }
