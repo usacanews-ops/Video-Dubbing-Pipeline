@@ -13,7 +13,7 @@ import edge_tts
 from pydub import AudioSegment
 
 SPEED_FACTOR = 1.12  # Uniform +12% speed increase across the entire video
-MAX_ATEMPO_COMPRESSION = 1.15  # Max audio compression to preserve quality
+MAX_ATEMPO_COMPRESSION = 1.15  # Max artificial audio compression
 
 # ==========================================
 # 1. 📥 Download Media & Sanitize Streams
@@ -82,7 +82,7 @@ def get_duration(file_path: str) -> float:
     return float(subprocess.check_output(cmd, shell=True).strip())
 
 # ==========================================
-# 2. 🛡️ Translation & Filtering
+# 2. 🛡️ Translation & Filtering (No Indian English)
 # ==========================================
 def contains_devanagari(text: str) -> bool:
     return bool(re.search(r'[\u0900-\u097F]', text))
@@ -130,11 +130,11 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     if not raw_list:
         return []
 
-    # Merge tight speech fragments (< 0.2s pause)
+    # AGGRESSIVE MERGING: Combine fragments into full sentences to prevent TTS overflow
     merged = [raw_list[0]]
     for s in raw_list[1:]:
         prev = merged[-1]
-        if s["start"] - prev["end"] < 0.2:
+        if s["start"] - prev["end"] < 1.0:  # Merge if pause is less than 1.0s
             prev["end"] = max(prev["end"], s["end"])
             prev["text"] += " " + s["text"]
         else:
@@ -144,9 +144,9 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     first_preview_printed = False
 
     for i, s in enumerate(merged):
-        # Calculate available window until the next person speaks
+        # Calculate maximum available window before the next sentence begins
         next_start = merged[i + 1]["start"] if i + 1 < len(merged) else s["end"] + 3.0
-        available_window = max(0.5, next_start - s["start"])
+        available_window = max(0.5, next_start - s["start"] - 0.05)
 
         if target_lang == "hi":
             translated = translate_to_hindi(s["text"])
@@ -156,6 +156,7 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
             except Exception:
                 translated = s["text"]
 
+        # Prevent English text from being narrated in an Indian accent
         if target_lang == "hi" and not contains_devanagari(translated):
             translated = ""
 
@@ -207,16 +208,15 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             continue
 
         try:
-            # 1. Native Fast Generation (+20% limits reliance on artificial atempo)
-            communicate = edge_tts.Communicate(text, voice, rate="+20%")
+            # Generate natively fast speech (+25%) to fit naturally without algorithm distortion
+            communicate = edge_tts.Communicate(text, voice, rate="+25%")
             await communicate.save(raw_tts_file)
             natural_dur = get_duration(raw_tts_file)
             
-            # 2. Strict Capped Compression Logic
+            # Strict capping logic to max 1.15x
             ratio = natural_dur / seg["available_window"]
             
             if ratio > 1.0:
-                # Limit compression to exactly 1.15x
                 compress_factor = min(ratio, MAX_ATEMPO_COMPRESSION)
                 apply_atempo(raw_tts_file, compress_factor, final_clip_file)
                 seg["clip_file"] = final_clip_file
@@ -228,16 +228,15 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             seg["clip_file"] = None
 
 # ==========================================
-# 4. 🎬 Blazing Fast Single-Pass Assembly
+# 4. 🎬 Blazing Fast Strict-Anchored Assembly
 # ==========================================
 def render_dubbed_video(video_path: str, segments: list[dict], output_file: str):
     src_total_dur = get_duration(video_path)
     
-    print("🎬 Building master audio track (No frame freezes, preserving video timeline)...")
+    print("🎬 Building master audio track (Strict Timestamp Anchoring)...")
     
-    # Create a blank canvas matching the video duration
+    # Create a blank master canvas matching the original video duration
     master_track = AudioSegment.silent(duration=int((src_total_dur + 5.0) * 1000))
-    audio_cursor = 0.0
 
     for seg in segments:
         if not seg.get("clip_file") or not os.path.exists(seg["clip_file"]):
@@ -246,24 +245,22 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
         clip = AudioSegment.from_file(seg["clip_file"])
         clip_dur = len(clip) / 1000.0
         
-        # Smart Anchoring: Start at original timestamp, or shift slightly if previous clip bled over
-        start_time = max(seg["start"], audio_cursor)
+        # STRICT ANCHORING: Clip starts at the exact millisecond the original audio started. 
+        # (Zero Lag Guarantee)
+        start_time = seg["start"]
         
         master_track = master_track.overlay(clip, position=int(start_time * 1000))
         
-        # Advance cursor to prevent voice overlap
-        audio_cursor = start_time + clip_dur
-        
-        # Save exact timestamps for SRT Subtitles
+        # Save exact timestamps for Subtitles
         seg["final_start"] = start_time
-        seg["final_end"] = audio_cursor
+        seg["final_end"] = start_time + clip_dur
 
     synced_audio_path = "synced_master.wav"
     master_track.export(synced_audio_path, format="wav")
 
-    print(f"⚡ Merging Audio/Video with uniform +12% ({SPEED_FACTOR}x) boost...")
+    print(f"⚡ Synchronous Encode: Video & Audio both accelerated by +12% ({SPEED_FACTOR}x)...")
     
-    # Single ffmpeg command (100x faster than chunking)
+    # Single ffmpeg command applies the 1.12x speedup universally.
     cmd = [
         'ffmpeg', '-y', '-err_detect', 'ignore_err',
         '-i', video_path,
@@ -302,7 +299,7 @@ def generate_srt(segments: list[dict], output_file: str = "subtitles.srt"):
             if not txt or "final_start" not in seg:
                 continue
 
-            # Scale timestamps by 1.12 to match the accelerated output video
+            # Scale timestamps by 1.12 to precisely match the accelerated output video
             scaled_start = seg["final_start"] / SPEED_FACTOR
             scaled_end = seg["final_end"] / SPEED_FACTOR
 
