@@ -13,7 +13,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -39,6 +41,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -60,10 +63,11 @@ data class QueueItem(
 
 data class HistoryItem(
     val id: String,
-    val title: String,
+    var title: String,
     val downloadUrl: String,
     val srtUrl: String,
     val timestamp: String,
+    var sourceMetaText: String = "",
     var isUploaded: Boolean = false
 )
 
@@ -98,7 +102,7 @@ class ProgressRequestBody(
 object DubberQueueManager {
     val queue = ConcurrentLinkedQueue<QueueItem>()
     var isProcessing by mutableStateOf(false)
-    var currentStatus by mutableStateOf("Ready to dub")
+    var currentStatus by mutableStateOf("Ready")
     var detailedLogs by mutableStateOf("")
     var firstLinePreview by mutableStateOf("")
     var queueSize by mutableStateOf(0)
@@ -117,10 +121,11 @@ object DubberQueueManager {
                 historyList.add(
                     HistoryItem(
                         id = obj.getString("id"),
-                        title = obj.getString("title"),
+                        title = obj.optString("title", "Dubbed Video"),
                         downloadUrl = obj.getString("downloadUrl"),
                         srtUrl = obj.optString("srtUrl", ""),
                         timestamp = obj.getString("timestamp"),
+                        sourceMetaText = obj.optString("sourceMetaText", ""),
                         isUploaded = obj.optBoolean("isUploaded", false)
                     )
                 )
@@ -139,12 +144,23 @@ object DubberQueueManager {
                 put("downloadUrl", h.downloadUrl)
                 put("srtUrl", h.srtUrl)
                 put("timestamp", h.timestamp)
+                put("sourceMetaText", h.sourceMetaText)
                 put("isUploaded", h.isUploaded)
             }
             arr.put(obj)
         }
         val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
         prefs.edit().putString("history_json", arr.toString()).apply()
+    }
+
+    fun removeItem(context: Context, item: HistoryItem) {
+        historyList.remove(item)
+        saveHistory(context)
+    }
+
+    fun clearAll(context: Context) {
+        historyList.clear()
+        saveHistory(context)
     }
 
     fun addHistoryItem(context: Context, item: HistoryItem) {
@@ -192,7 +208,7 @@ object DubberQueueManager {
                 },
                 onComplete = { _, _ ->
                     isProcessing = false
-                    currentStatus = "🎉 Dub Finished! Link ready."
+                    currentStatus = "🎉 Dubbing complete! Ready to schedule or upload."
                     processNext(context)
                 },
                 onError = { err ->
@@ -240,7 +256,7 @@ class MainActivity : ComponentActivity() {
                     QueueItem(videoUrl = extractedUrl, targetLang = lang, speed = speed),
                     this
                 )
-                Toast.makeText(this, "📥 Added to Dubbing Queue (#${DubberQueueManager.queueSize})", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "📥 Added to processing queue", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -258,12 +274,12 @@ fun DubberLiveApp() {
     val coroutineScope = rememberCoroutineScope()
     val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
 
-    var githubOwner by remember { mutableStateOf(prefs.getString("owner", "usacanews-ops") ?: "") }
-    var githubRepo by remember { mutableStateOf(prefs.getString("repo", "Video-Dubbing-Pipeline") ?: "") }
-    var githubToken by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
+    var cloudWorkspace by remember { mutableStateOf(prefs.getString("owner", "usacanews-ops") ?: "") }
+    var cloudRepository by remember { mutableStateOf(prefs.getString("repo", "Video-Dubbing-Pipeline") ?: "") }
+    var cloudServerKey by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
 
     var fbPagesRaw by remember {
-        mutableStateOf(prefs.getString("fb_pages_raw", "Main Page|100085938472910|EAA...") ?: "")
+        mutableStateOf(prefs.getString("fb_pages_raw", "Primary Page|100085938472910|EAA...") ?: "")
     }
 
     var customTitle by remember { mutableStateOf(prefs.getString("custom_title", "") ?: "") }
@@ -271,13 +287,17 @@ fun DubberLiveApp() {
         mutableStateOf(prefs.getString("custom_tags", "#fyp #moviejet #reels #hindidubbed #movieexplained") ?: "")
     }
 
+    var scheduleMinutesText by remember { mutableStateOf("0") }
+
     var videoUrl by remember { mutableStateOf("") }
     var selectedLanguage by remember { mutableStateOf("hi") }
-    var showSettings by remember { mutableStateOf(githubToken.isBlank()) }
+    var showSettings by remember { mutableStateOf(cloudServerKey.isBlank()) }
 
     var fbUploadStage by remember { mutableStateOf("") }
     var fbUploadPercent by remember { mutableIntStateOf(0) }
     var isUploadingToFb by remember { mutableStateOf(false) }
+
+    var activeMetadataDialog by remember { mutableStateOf<String?>(null) }
 
     val pageAccounts = remember(fbPagesRaw) {
         fbPagesRaw.lines().mapNotNull { line ->
@@ -290,6 +310,51 @@ fun DubberLiveApp() {
 
     var selectedPageAccount by remember(pageAccounts) {
         mutableStateOf(pageAccounts.firstOrNull())
+    }
+
+    // Selectable & Copyable Metadata Dialog
+    activeMetadataDialog?.let { metaText ->
+        AlertDialog(
+            onDismissRequest = { activeMetadataDialog = null },
+            title = { Text("ℹ️ Source Video Metadata", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Card(
+                    modifier = Modifier.fillMaxWidth().height(260.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(10.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        SelectionContainer {
+                            Text(
+                                text = metaText,
+                                fontSize = 12.sp,
+                                lineHeight = 16.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("Source Metadata", metaText))
+                    Toast.makeText(context, "📋 All metadata copied!", Toast.LENGTH_SHORT).show()
+                    activeMetadataDialog = null
+                }) {
+                    Text("📋 Copy All")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { activeMetadataDialog = null }) {
+                    Text("Close")
+                }
+            }
+        )
     }
 
     Column(
@@ -308,7 +373,7 @@ fun DubberLiveApp() {
                 Text("🎬 AI Movie Dubber", fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 if (DubberQueueManager.queueSize > 0 || DubberQueueManager.isProcessing) {
                     Text(
-                        "Queue: ${DubberQueueManager.queueSize} waiting | Processing: ${if (DubberQueueManager.isProcessing) "1" else "0"}",
+                        "Queue: ${DubberQueueManager.queueSize} waiting | Active: ${if (DubberQueueManager.isProcessing) "1" else "0"}",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.SemiBold
@@ -316,7 +381,7 @@ fun DubberLiveApp() {
                 }
             }
             TextButton(onClick = { showSettings = !showSettings }) {
-                Text(if (showSettings) "Hide Config" else "⚙️ Config")
+                Text(if (showSettings) "Close Config" else "⚙️ Config")
             }
         }
 
@@ -326,34 +391,34 @@ fun DubberLiveApp() {
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
             ) {
                 Column(modifier = Modifier.padding(14.dp)) {
-                    Text("GitHub Settings", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text("Cloud Engine Settings", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Spacer(modifier = Modifier.height(4.dp))
                     OutlinedTextField(
-                        value = githubOwner,
-                        onValueChange = { githubOwner = it; prefs.edit().putString("owner", it).apply() },
-                        label = { Text("Owner/Username") },
+                        value = cloudWorkspace,
+                        onValueChange = { cloudWorkspace = it; prefs.edit().putString("owner", it).apply() },
+                        label = { Text("Workspace / User") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     OutlinedTextField(
-                        value = githubRepo,
-                        onValueChange = { githubRepo = it; prefs.edit().putString("repo", it).apply() },
-                        label = { Text("Repo Name") },
+                        value = cloudRepository,
+                        onValueChange = { cloudRepository = it; prefs.edit().putString("repo", it).apply() },
+                        label = { Text("Pipeline Service Name") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     OutlinedTextField(
-                        value = githubToken,
-                        onValueChange = { githubToken = it; prefs.edit().putString("token", it).apply() },
-                        label = { Text("GitHub Token (PAT)") },
+                        value = cloudServerKey,
+                        onValueChange = { cloudServerKey = it; prefs.edit().putString("token", it).apply() },
+                        label = { Text("Pipeline Server Access Key") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
 
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("Multiple Facebook Pages (1 per line)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text("Facebook Pages (1 per line)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                     Text("Format: PageName|PageID|PageToken", fontSize = 11.sp, color = Color.Gray)
                     Spacer(modifier = Modifier.height(4.dp))
                     OutlinedTextField(
@@ -377,7 +442,7 @@ fun DubberLiveApp() {
                 customTitle = it
                 prefs.edit().putString("custom_title", it).apply()
             },
-            label = { Text("Custom Reel Title (Optional)") },
+            label = { Text("Custom Reel Title (Tap a title below to fill)") },
             placeholder = { Text("Movie Explained in Hindi") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true
@@ -391,7 +456,18 @@ fun DubberLiveApp() {
                 customTags = it
                 prefs.edit().putString("custom_tags", it).apply()
             },
-            label = { Text("Custom #Tags (Optional)") },
+            label = { Text("Custom #Tags") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        OutlinedTextField(
+            value = scheduleMinutesText,
+            onValueChange = { scheduleMinutesText = it.filter { ch -> ch.isDigit() } },
+            label = { Text("Schedule Upload (Minutes from now, 0 = Immediate)") },
+            placeholder = { Text("e.g. 30 (Min 20 mins for scheduler)") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true
         )
@@ -408,7 +484,6 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Horizontally scrollable language chips
         Text("Target Dubbing Language", modifier = Modifier.align(Alignment.Start), fontSize = 13.sp)
         Spacer(modifier = Modifier.height(4.dp))
         Row(
@@ -419,7 +494,7 @@ fun DubberLiveApp() {
         ) {
             listOf(
                 "hi" to "Hindi",
-                "en" to "English (Re-vocal)",
+                "en" to "English (Re-voice)",
                 "es" to "Spanish",
                 "fr" to "French",
                 "de" to "German",
@@ -451,13 +526,14 @@ fun DubberLiveApp() {
                 }
             },
             modifier = Modifier.fillMaxWidth().height(48.dp),
-            enabled = videoUrl.isNotBlank() && githubToken.isNotBlank()
+            enabled = videoUrl.isNotBlank() && cloudServerKey.isNotBlank()
         ) {
-            Text("➕ Add to AutoDub Queue", fontSize = 15.sp)
+            Text("➕ Add to Processing Queue", fontSize = 15.sp)
         }
 
         Spacer(modifier = Modifier.height(10.dp))
 
+        // Live Download/Buffering & Upload Progress Indicator
         if (isUploadingToFb) {
             Card(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -484,7 +560,7 @@ fun DubberLiveApp() {
                 if (DubberQueueManager.firstLinePreview.isNotBlank()) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        "🗣️ 1st Line (5 words): \"${DubberQueueManager.firstLinePreview}\"",
+                        "🗣️ 1st Line: \"${DubberQueueManager.firstLinePreview}\"",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF00796B)
@@ -504,40 +580,74 @@ fun DubberLiveApp() {
 
         if (DubberQueueManager.historyList.isNotEmpty()) {
             Spacer(modifier = Modifier.height(14.dp))
-            Text("🕒 Previous Download Links (Last 10)", fontWeight = FontWeight.Bold, fontSize = 15.sp, modifier = Modifier.align(Alignment.Start))
-            Spacer(modifier = Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("🕒 Generated Videos (${DubberQueueManager.historyList.size})", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                TextButton(
+                    onClick = { DubberQueueManager.clearAll(context) },
+                    colors = ButtonDefaults.textButtonColors(contentColor = Color.Red)
+                ) {
+                    Text("🗑️ Clear All", fontSize = 12.sp)
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
 
             Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                DubberQueueManager.historyList.forEachIndexed { index, history ->
+                DubberQueueManager.historyList.forEach { history ->
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
+                            // Header Row: Source Title + Info Icon + '✕' Delete
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(history.title, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                                Text(history.timestamp, fontSize = 11.sp, color = Color.Gray)
-                            }
-
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                history.downloadUrl,
-                                fontSize = 11.sp,
-                                color = MaterialTheme.colorScheme.primary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.clickable {
-                                    val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(history.downloadUrl))
-                                    context.startActivity(browserIntent)
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = history.title,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.clickable {
+                                            customTitle = history.title
+                                            prefs.edit().putString("custom_title", history.title).apply()
+                                            Toast.makeText(context, "Populated title in Custom Box!", Toast.LENGTH_SHORT).show()
+                                        }
+                                    )
+                                    Text(history.timestamp, fontSize = 10.sp, color = Color.Gray)
                                 }
-                            )
+
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (history.sourceMetaText.isNotBlank()) {
+                                        IconButton(
+                                            onClick = { activeMetadataDialog = history.sourceMetaText },
+                                            modifier = Modifier.size(28.dp)
+                                        ) {
+                                            Text("ℹ️", fontSize = 14.sp)
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.width(4.dp))
+
+                                    IconButton(
+                                        onClick = { DubberQueueManager.removeItem(context, history) },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Text("✕", fontWeight = FontWeight.Bold, color = Color.Gray, fontSize = 14.sp)
+                                    }
+                                }
+                            }
 
                             Spacer(modifier = Modifier.height(8.dp))
 
+                            // Page Selector Dropdown
                             var dropdownExpanded by remember { mutableStateOf(false) }
                             Box(modifier = Modifier.fillMaxWidth()) {
                                 OutlinedButton(
@@ -546,7 +656,7 @@ fun DubberLiveApp() {
                                     contentPadding = PaddingValues(horizontal = 8.dp)
                                 ) {
                                     Text(
-                                        "Target: ${selectedPageAccount?.name ?: "Select Page"} ▼",
+                                        "Target: ${selectedPageAccount?.name ?: "Select Target Page"} ▼",
                                         fontSize = 11.sp,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
@@ -573,9 +683,9 @@ fun DubberLiveApp() {
                             // Action Buttons Row: Watch | Copy | Open | Upload
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                // 1. Direct Stream Video Player
                                 Button(
                                     onClick = {
                                         try {
@@ -583,55 +693,60 @@ fun DubberLiveApp() {
                                                 setDataAndType(Uri.parse(history.downloadUrl), "video/*")
                                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                             }
-                                            context.startActivity(Intent.createChooser(streamIntent, "Stream Video"))
+                                            context.startActivity(Intent.createChooser(streamIntent, "Watch Video"))
                                         } catch (e: Exception) {
                                             Toast.makeText(context, "No video player installed", Toast.LENGTH_SHORT).show()
                                         }
                                     },
-                                    modifier = Modifier.weight(1f).height(36.dp),
+                                    modifier = Modifier.size(38.dp),
+                                    shape = CircleShape,
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
-                                    contentPadding = PaddingValues(horizontal = 2.dp)
+                                    contentPadding = PaddingValues(0.dp)
                                 ) {
-                                    Text("▶ Watch", fontSize = 11.sp, color = Color.White)
+                                    Text("▶", fontSize = 14.sp, color = Color.White)
                                 }
 
-                                // 2. Copy Link
                                 OutlinedButton(
                                     onClick = {
                                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                        clipboard.setPrimaryClip(ClipData.newPlainText("Dubbed Link", history.downloadUrl))
+                                        clipboard.setPrimaryClip(ClipData.newPlainText("Link", history.downloadUrl))
                                         Toast.makeText(context, "📋 Link copied!", Toast.LENGTH_SHORT).show()
                                     },
-                                    modifier = Modifier.weight(0.9f).height(36.dp),
-                                    contentPadding = PaddingValues(horizontal = 2.dp)
+                                    modifier = Modifier.size(38.dp),
+                                    shape = CircleShape,
+                                    contentPadding = PaddingValues(0.dp)
                                 ) {
-                                    Text("📋 Copy", fontSize = 11.sp)
+                                    Text("📋", fontSize = 13.sp)
                                 }
 
-                                // 3. Open in Browser
                                 OutlinedButton(
                                     onClick = {
                                         val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse(history.downloadUrl))
                                         context.startActivity(browserIntent)
                                     },
-                                    modifier = Modifier.weight(0.9f).height(36.dp),
-                                    contentPadding = PaddingValues(horizontal = 2.dp)
+                                    modifier = Modifier.size(38.dp),
+                                    shape = CircleShape,
+                                    contentPadding = PaddingValues(0.dp)
                                 ) {
-                                    Text("⬇️ Open", fontSize = 11.sp)
+                                    Text("↗", fontSize = 14.sp, fontWeight = FontWeight.Bold)
                                 }
 
-                                // 4. Direct Upload FB with Dynamic Re-upload State
                                 Button(
                                     onClick = {
                                         val targetPage = selectedPageAccount
                                         if (targetPage == null) {
-                                            Toast.makeText(context, "Configure at least one FB Page in Config!", Toast.LENGTH_SHORT).show()
+                                            Toast.makeText(context, "Configure at least one Page in Config!", Toast.LENGTH_SHORT).show()
                                             showSettings = true
                                         } else {
                                             isUploadingToFb = true
-                                            val finalTitle = customTitle.ifBlank { "Movie Explained" }
+                                            val finalTitle = customTitle.ifBlank { history.title }
                                             val finalTags = customTags.ifBlank { "#fyp #moviejet #reels #hindidubbed #movieexplained" }
                                             val finalCaption = "$finalTitle\n.\n.\n$finalTags"
+
+                                            val schedMins = scheduleMinutesText.toLongOrNull() ?: 0L
+                                            val scheduleUnix = if (schedMins >= 20L) {
+                                                (System.currentTimeMillis() / 1000) + (schedMins * 60)
+                                            } else null
 
                                             coroutineScope.launch {
                                                 uploadUrlDirectlyToFacebook(
@@ -641,6 +756,7 @@ fun DubberLiveApp() {
                                                     videoUrl = history.downloadUrl,
                                                     srtUrl = history.srtUrl,
                                                     description = finalCaption,
+                                                    scheduledPublishTime = scheduleUnix,
                                                     onProgress = { stage, percent ->
                                                         fbUploadStage = stage
                                                         fbUploadPercent = percent
@@ -649,37 +765,52 @@ fun DubberLiveApp() {
                                                         isUploadingToFb = false
                                                         history.isUploaded = true
                                                         DubberQueueManager.saveHistory(context)
-                                                        Toast.makeText(context, "🎉 Published Reel with Subtitles!", Toast.LENGTH_LONG).show()
+                                                        val msg = if (scheduleUnix != null) "📅 Scheduled successfully!" else "🎉 Published directly to FB!"
+                                                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                                                     },
                                                     onError = { err ->
                                                         isUploadingToFb = false
-                                                        Toast.makeText(context, "❌ FB Upload Error: $err", Toast.LENGTH_LONG).show()
+                                                        Toast.makeText(context, "❌ Upload Error: $err", Toast.LENGTH_LONG).show()
                                                     }
                                                 )
                                             }
                                         }
                                     },
-                                    modifier = Modifier.weight(1.3f).height(36.dp),
+                                    modifier = Modifier.weight(1f).height(38.dp),
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = if (history.isUploaded) Color(0xFFE65100) else Color(0xFF1877F2)
                                     ),
-                                    contentPadding = PaddingValues(horizontal = 2.dp)
+                                    contentPadding = PaddingValues(horizontal = 6.dp)
                                 ) {
-                                    Text(
-                                        if (history.isUploaded) "🔄 Re-upload" else "🚀 Upload FB",
-                                        fontSize = 10.sp,
-                                        color = Color.White
-                                    )
+                                    val schedMins = scheduleMinutesText.toLongOrNull() ?: 0L
+                                    val btnLabel = when {
+                                        schedMins >= 20L -> "📅 Schedule"
+                                        history.isUploaded -> "🔄 Re-upload"
+                                        else -> "🚀 Upload FB"
+                                    }
+                                    Text(btnLabel, fontSize = 11.sp, color = Color.White)
                                 }
                             }
                         }
                     }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = { DubberQueueManager.clearAll(context) },
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Red)
+                ) {
+                    Text("🗑️ Clear All Videos from List", fontSize = 13.sp)
                 }
             }
         }
     }
 }
 
+// =========================================================================
+// 🚀 Cloud Pipeline Orchestrator (Agnostic Terminology)
+// =========================================================================
 suspend fun executeCloudDubbingPipeline(
     context: Context,
     owner: String,
@@ -696,7 +827,7 @@ suspend fun executeCloudDubbingPipeline(
     val authHeader = "Bearer $token"
 
     try {
-        onStatusUpdate("⚡ Dispatching Pipeline...", "Triggering GitHub Actions workflow...", "")
+        onStatusUpdate("⚡ Dispatching task...", "Connecting to cloud worker pipeline...", "")
 
         val dispatchUrl = "https://api.github.com/repos/$owner/$repo/actions/workflows/dub_video.yml/dispatches"
         val payload = JSONObject().apply {
@@ -717,11 +848,11 @@ suspend fun executeCloudDubbingPipeline(
 
         val response = client.newCall(request).execute()
         if (!response.isSuccessful && response.code != 204) {
-            onError("HTTP ${response.code}: Check Token/Repo permissions")
+            onError("HTTP ${response.code}: Check Pipeline Credentials")
             return@withContext
         }
 
-        onStatusUpdate("⏳ Queued on GitHub...", "Waiting for cloud runner...", "")
+        onStatusUpdate("⏳ Queued on cloud...", "Awaiting available worker instance...", "")
         delay(6000)
 
         var runId: Long? = null
@@ -741,13 +872,14 @@ suspend fun executeCloudDubbingPipeline(
         }
 
         if (runId == null) {
-            onError("Workflow run could not be found.")
+            onError("Task could not be initialized on the server.")
             return@withContext
         }
 
         var isDone = false
         var runConclusion = ""
         var extractedPreview = ""
+        var emittedTitle = "Dubbed Video"
 
         while (!isDone) {
             delay(3500)
@@ -765,7 +897,7 @@ suspend fun executeCloudDubbingPipeline(
                     val conclusion = job.optString("conclusion")
                     val steps = job.optJSONArray("steps")
 
-                    var activeStep = "Executing dubbing pipeline..."
+                    var activeStep = "Processing audio/video streams..."
                     if (steps != null) {
                         for (j in 0 until steps.length()) {
                             val step = steps.getJSONObject(j)
@@ -776,7 +908,7 @@ suspend fun executeCloudDubbingPipeline(
                         }
                     }
 
-                    if (extractedPreview.isBlank() && jobId != 0L) {
+                    if (jobId != 0L) {
                         try {
                             val logReq = Request.Builder()
                                 .url("https://api.github.com/repos/$owner/$repo/actions/jobs/$jobId/logs")
@@ -785,15 +917,19 @@ suspend fun executeCloudDubbingPipeline(
                             val logRes = client.newCall(logReq).execute()
                             if (logRes.isSuccessful) {
                                 val logText = logRes.body?.string() ?: ""
-                                val m = Pattern.compile("TRANSLATION_PREVIEW:\\s*(.+)").matcher(logText)
-                                if (m.find()) {
-                                    extractedPreview = m.group(1)?.trim() ?: ""
+
+                                if (extractedPreview.isBlank()) {
+                                    val m = Pattern.compile("TRANSLATION_PREVIEW:\\s*(.+)").matcher(logText)
+                                    if (m.find()) extractedPreview = m.group(1)?.trim() ?: ""
                                 }
+
+                                val tm = Pattern.compile("TITLE_EMIT:\\s*(.+)").matcher(logText)
+                                if (tm.find()) emittedTitle = tm.group(1)?.trim() ?: emittedTitle
                             }
                         } catch (_: Exception) {}
                     }
 
-                    onStatusUpdate("⚙️ $activeStep", "Run ID: $runId", extractedPreview)
+                    onStatusUpdate("⚙️ $activeStep", "Task #$runId", extractedPreview)
 
                     if (status == "completed") {
                         isDone = true
@@ -804,11 +940,11 @@ suspend fun executeCloudDubbingPipeline(
         }
 
         if (runConclusion != "success") {
-            onError("Workflow failed with conclusion: $runConclusion")
+            onError("Task completed with code: $runConclusion")
             return@withContext
         }
 
-        onStatusUpdate("🔗 Fetching Download Links...", "Querying release assets...", extractedPreview)
+        onStatusUpdate("🔗 Fetching cloud assets...", "Assembling media package...", extractedPreview)
         delay(2000)
 
         val releaseUrl = "https://api.github.com/repos/$owner/$repo/releases/latest"
@@ -817,6 +953,7 @@ suspend fun executeCloudDubbingPipeline(
 
         var videoDownloadUrl = ""
         var srtDownloadUrl = ""
+        var sourceMetadataJson = ""
 
         if (relRes.isSuccessful) {
             val relJson = JSONObject(relRes.body?.string() ?: "")
@@ -829,6 +966,15 @@ suspend fun executeCloudDubbingPipeline(
                         videoDownloadUrl = asset.getString("browser_download_url")
                     } else if (name.endsWith(".srt") || name == "subtitles.srt") {
                         srtDownloadUrl = asset.getString("browser_download_url")
+                    } else if (name == "source_meta.json") {
+                        try {
+                            val mfReq = Request.Builder().url(asset.getString("browser_download_url")).addHeader("Authorization", authHeader).build()
+                            val mfRes = client.newCall(mfReq).execute()
+                            val mfStr = mfRes.body?.string() ?: ""
+                            val parsed = JSONObject(mfStr)
+                            emittedTitle = parsed.optString("title", emittedTitle)
+                            sourceMetadataJson = "TITLE:\n${parsed.optString("title")}\n\nTAGS:\n${parsed.optJSONArray("tags")}\n\nDESCRIPTION:\n${parsed.optString("description")}"
+                        } catch (_: Exception) {}
                     }
                 }
             }
@@ -844,10 +990,11 @@ suspend fun executeCloudDubbingPipeline(
                 context,
                 HistoryItem(
                     id = runId.toString(),
-                    title = "Dubbed Video (#$runId)",
+                    title = emittedTitle,
                     downloadUrl = videoDownloadUrl,
                     srtUrl = srtDownloadUrl,
                     timestamp = timeStr,
+                    sourceMetaText = sourceMetadataJson,
                     isUploaded = false
                 )
             )
@@ -856,11 +1003,14 @@ suspend fun executeCloudDubbingPipeline(
 
     } catch (e: Exception) {
         withContext(Dispatchers.Main) {
-            onError(e.localizedMessage ?: "Process failed")
+            onError(e.localizedMessage ?: "Processing error")
         }
     }
 }
 
+// =========================================================================
+// 🎬 Facebook Reels Publisher (Live Buffering + Live Socket Upload Tracking)
+// =========================================================================
 suspend fun uploadUrlDirectlyToFacebook(
     context: Context,
     pageId: String,
@@ -868,6 +1018,7 @@ suspend fun uploadUrlDirectlyToFacebook(
     videoUrl: String,
     srtUrl: String,
     description: String,
+    scheduledPublishTime: Long?,
     onProgress: (String, Int) -> Unit,
     onSuccess: () -> Unit,
     onError: (String) -> Unit
@@ -900,26 +1051,53 @@ suspend fun uploadUrlDirectlyToFacebook(
         val uploadUrl = initJson.optString("upload_url")
 
         if (videoId.isBlank() || uploadUrl.isBlank()) {
-            val errorMsg = initJson.optJSONObject("error")?.optString("message") ?: "Init session failed"
+            val errorMsg = initJson.optJSONObject("error")?.optString("message") ?: "Session init failed"
             withContext(Dispatchers.Main) { onError(errorMsg) }
             return@withContext
         }
 
-        onProgress("Buffering cloud MP4...", 5)
+        // Live Buffering / Download Tracking from Server
         val sourceReq = Request.Builder().url(videoUrl).build()
         val sourceRes = uploadClient.newCall(sourceReq).execute()
 
-        sourceRes.body!!.byteStream().use { input ->
-            FileOutputStream(tempVideoFile).use { output -> input.copyTo(output) }
+        if (!sourceRes.isSuccessful || sourceRes.body == null) {
+            withContext(Dispatchers.Main) { onError("Could not download video: HTTP ${sourceRes.code}") }
+            return@withContext
         }
 
+        val totalContentLength = sourceRes.body!!.contentLength()
+        val inputStream: InputStream = sourceRes.body!!.byteStream()
+
+        FileOutputStream(tempVideoFile).use { output ->
+            val buffer = ByteArray(8192)
+            var bytesRead: Int
+            var totalBytesRead = 0L
+
+            while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                output.write(buffer, 0, bytesRead)
+                totalBytesRead += bytesRead
+
+                if (totalContentLength > 0) {
+                    val percent = ((totalBytesRead * 100) / totalContentLength).toInt()
+                    val mbRead = totalBytesRead / (1024 * 1024)
+                    val mbTotal = totalContentLength / (1024 * 1024)
+                    onProgress("Buffering from server: $percent% ($mbRead MB / $mbTotal MB)", percent)
+                } else {
+                    val mbRead = totalBytesRead / (1024 * 1024)
+                    onProgress("Buffering from server: $mbRead MB", 50)
+                }
+            }
+            output.flush()
+        }
+
+        // Live Upload Tracking to Facebook
         val countingBody = ProgressRequestBody(
             file = tempVideoFile,
             contentType = "application/octet-stream".toMediaType()
         ) { percent, sent, total ->
             val mbSent = sent / (1024 * 1024)
             val mbTotal = total / (1024 * 1024)
-            onProgress("Uploading video: $percent% ($mbSent MB / $mbTotal MB)", percent)
+            onProgress("Uploading to FB: $percent% ($mbSent MB / $mbTotal MB)", percent)
         }
 
         val uploadReq = Request.Builder()
@@ -932,9 +1110,10 @@ suspend fun uploadUrlDirectlyToFacebook(
 
         uploadClient.newCall(uploadReq).execute().close()
 
+        // Attach SRT Captions
         if (srtUrl.isNotBlank()) {
             try {
-                onProgress("Attaching .srt captions...", 95)
+                onProgress("Syncing subtitles...", 95)
                 val srtReq = Request.Builder().url(srtUrl).build()
                 val srtRes = uploadClient.newCall(srtReq).execute()
                 if (srtRes.isSuccessful && srtRes.body != null) {
@@ -962,14 +1141,25 @@ suspend fun uploadUrlDirectlyToFacebook(
             } catch (_: Exception) {}
         }
 
-        onProgress("Publishing Reel to Facebook...", 99)
+        // Finalize Publish or Schedule on Facebook
+        onProgress(if (scheduledPublishTime != null) "Scheduling Reel on Meta..." else "Publishing Reel...", 99)
         val publishUrl = "https://graph.facebook.com/v20.0/$pageId/video_reels"
         val pubPayload = JSONObject().apply {
             put("upload_phase", "finish")
             put("access_token", pageToken)
             put("video_id", videoId)
-            put("video_state", "PUBLISHED")
             put("description", description)
+
+            if (scheduledPublishTime != null) {
+                put("video_state", "SCHEDULED")
+                put("scheduled_publish_time", scheduledPublishTime)
+            } else {
+                put("video_state", "PUBLISHED")
+            }
+
+            put("privacy", JSONObject().apply {
+                put("value", "EVERYONE")
+            })
         }
 
         val pubReq = Request.Builder()
@@ -983,7 +1173,7 @@ suspend fun uploadUrlDirectlyToFacebook(
         if (pubJson.optBoolean("success", false) || pubJson.has("video_id")) {
             withContext(Dispatchers.Main) { onSuccess() }
         } else {
-            val errorMsg = pubJson.optJSONObject("error")?.optString("message") ?: "Publishing failed"
+            val errorMsg = pubJson.optJSONObject("error")?.optString("message") ?: "Dispatch failed"
             withContext(Dispatchers.Main) { onError(errorMsg) }
         }
 
