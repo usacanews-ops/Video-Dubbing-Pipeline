@@ -57,3 +57,17 @@ jobs:
             source_meta.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🧹 Prune Old Releases (Keep Latest 25)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Checking for old releases to prune..."
+          # Fetch up to 100 releases, skip the newest 25, and delete the rest along with their tags
+          gh release list --limit 100 --json tagName --jq '.[25:] | .[].tagName' | while read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "Deleting expired release & tag: $tag"
+              gh release delete "$tag" --cleanup-tag --yes || true
+            fi
+          done
+          echo "Release cleanup completed successfully."
