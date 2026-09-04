@@ -265,74 +265,101 @@ def invalid_translation(text):
 # TRANSLATION
 # ============================================================
 
-def translate_text(
-    text,
-    target
-):
+def translate_text(text,target):
+    text=clean_text(text)
 
-    text = clean_text(text)
-
-    if len(text) < 2:
+    if len(text)<2:
         return text
 
-    # Primary translator
+    # deep-translator uses language names more reliably
+    # for MyMemory than short codes such as "hi".
+    mymemory_codes={
+        "hi":"hindi",
+        "en":"english",
+        "bn":"bengali",
+        "ta":"tamil",
+        "te":"telugu",
+        "mr":"marathi",
+        "gu":"gujarati",
+        "kn":"kannada",
+        "ml":"malayalam",
+        "pa":"punjabi",
+        "fr":"french",
+        "de":"german",
+        "es":"spanish",
+        "it":"italian",
+        "pt":"portuguese",
+        "nl":"dutch",
+        "pl":"polish",
+        "tr":"turkish",
+        "ru":"russian",
+        "uk":"ukrainian",
+        "ja":"japanese",
+        "ko":"korean",
+        "zh":"chinese",
+        "ar":"arabic"
+    }
+
+    # --------------------------------------------------------
+    # GoogleTranslator
+    # --------------------------------------------------------
+
     for attempt in range(3):
-
         try:
-
-            result = GoogleTranslator(
+            result=GoogleTranslator(
                 source="auto",
                 target=target
             ).translate(text)
 
-            if (
-                result and
-                not invalid_translation(result)
-            ):
+            if result and not invalid_translation(result):
 
-                if (
-                    target != "hi" or
-                    contains_hindi(result)
-                ):
+                if target!="hi" or contains_hindi(result):
                     return result.strip()
 
         except Exception as e:
-
             print(
-                f"⚠️ Translation retry "
-                f"{attempt + 1}/3: {e}"
+                f"⚠️ Google translation "
+                f"{attempt+1}/3: {e}"
             )
-
             time.sleep(0.5)
 
-    # Fallback translator
-    try:
+    # --------------------------------------------------------
+    # MyMemory fallback
+    # --------------------------------------------------------
 
-        result = MyMemoryTranslator(
+    mm_target=mymemory_codes.get(
+        target.lower(),
+        target
+    )
+
+    try:
+        result=MyMemoryTranslator(
             source="auto",
-            target=target
+            target=mm_target
         ).translate(text)
 
-        if (
-            result and
-            not invalid_translation(result)
-        ):
+        if result and not invalid_translation(result):
 
-            if (
-                target != "hi" or
-                contains_hindi(result)
-            ):
+            if target!="hi" or contains_hindi(result):
                 return result.strip()
 
     except Exception as e:
-
         print(
-            "⚠️ Fallback translation:",
-            e
+            f"⚠️ MyMemory fallback failed: {e}"
         )
 
-    # CRITICAL:
-    # Never return an empty dialogue.
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Never return empty text.
+    # Never allow translation failure to remove
+    # a dialogue segment.
+    # --------------------------------------------------------
+
+    print(
+        "⚠️ Translation failed; "
+        "using original transcription."
+    )
+
     return text
 
 
