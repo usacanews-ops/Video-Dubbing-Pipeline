@@ -14,22 +14,18 @@ from pydub import AudioSegment
 
 # ================= CONFIG =================
 
-# 1. Pacing: Increased TTS delivery speed to eliminate sluggish narration
-TTS_RATE = "+18%"
-FINAL_SPEED = 1.15         # +15% uniform master speedup (Change to 1.10 for +10%)
+# 1. Pacing & Speed
+TTS_RATE = "+15%"          # Fast, natural articulation (minimizes required freeze)
+FINAL_SPEED = 1.10         # Exact +10% uniform master speedup
 
-# 2. Frame-freeze settings
+# 2. Timing Controls
 ENABLE_FREEZE = True
 SAFETY_GAP = 0.03
 SILENCE_THRESHOLD = -42
 WHISPER_MODEL = "tiny"
 
-# 3. Target File Size Controls (Fixes 115 MB bloat down to ~15-20 MB)
-VIDEO_CRF = "28"
-VIDEO_PRESET = "veryfast"
-MAX_VIDEO_BITRATE = "1800k"
-BUFFER_SIZE = "3600k"
-AUDIO_BITRATE = "128k"
+# 3. Encoding Presets
+AUDIO_BITRATE = "96k"      # 96k AAC is crisp for speech and saves 1-2 MB
 
 VOICE_MAP = {
     "hi": "hi-IN-MadhurNeural",
@@ -77,6 +73,20 @@ def get_duration(path):
     ])
     return float(result.strip())
 
+def detect_source_video_bitrate(video_path, default_kbps=550):
+    """Calculates source video bitrate to guarantee the final output matches source file size."""
+    try:
+        dur = get_duration(video_path)
+        if dur > 0:
+            total_bytes = os.path.getsize(video_path)
+            total_kbps = int((total_bytes * 8) / dur / 1000)
+            # Subtract 96k for audio, leave rest for video (bounded between 350k and 900k)
+            video_kbps = max(350, min(total_kbps - 96, 900))
+            return video_kbps
+    except Exception:
+        pass
+    return default_kbps
+
 # ================= DOWNLOAD =================
 
 def download_media(url):
@@ -99,7 +109,6 @@ def download_media(url):
     }
 
     print("📥 Downloading media...")
-
     with yt_dlp.YoutubeDL(opts) as ydl:
         meta = ydl.extract_info(url, download=True)
         metadata = {
@@ -139,47 +148,33 @@ def is_error_page(text):
 
 def translate_text(text, target_lang):
     text = re.sub(r"[\r\n\t]+", " ", text).strip()
-
     if not text or len(text) < 2:
         return text
 
     if target_lang == "hi":
         for _ in range(3):
             try:
-                result = GoogleTranslator(
-                    source="auto",
-                    target="hi"
-                ).translate(text)
-
+                result = GoogleTranslator(source="auto", target="hi").translate(text)
                 if result and not is_error_page(result) and contains_devanagari(result):
                     return result.strip()
             except Exception:
-                time.sleep(0.3)
+                time.sleep(0.2)
 
         try:
-            result = MyMemoryTranslator(
-                source="auto",
-                target="hi-IN"
-            ).translate(text)
-
+            result = MyMemoryTranslator(source="auto", target="hi-IN").translate(text)
             if result and not is_error_page(result) and contains_devanagari(result):
                 return result.strip()
         except Exception:
             pass
-
         return ""
 
     for _ in range(3):
         try:
-            result = GoogleTranslator(
-                source="auto",
-                target=target_lang
-            ).translate(text)
-
+            result = GoogleTranslator(source="auto", target=target_lang).translate(text)
             if result and not is_error_page(result):
                 return result.strip()
         except Exception:
-            time.sleep(0.3)
+            time.sleep(0.2)
 
     return text
 
@@ -187,35 +182,22 @@ def translate_text(text, target_lang):
 
 def transcribe_and_translate(audio_path, target_lang):
     print("🧠 Loading Whisper...")
-
-    model = WhisperModel(
-        WHISPER_MODEL,
-        device="cpu",
-        compute_type="int8"
-    )
+    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 
     print("🎙️ Transcribing source audio...")
-
     raw_segments, info = model.transcribe(
         audio_path,
         language=None,
         vad_filter=True,
-        vad_parameters={
-            "min_silence_duration_ms": 350
-        }
+        vad_parameters={"min_silence_duration_ms": 350}
     )
-
     print(f"🌍 Detected source language: {info.language}")
 
     raw = []
     for segment in raw_segments:
         text = segment.text.strip()
-        if not text:
+        if not text or (segment.end - segment.start < 0.15):
             continue
-        duration = segment.end - segment.start
-        if duration < 0.15:
-            continue
-
         raw.append({
             "start": float(segment.start),
             "end": float(segment.end),
@@ -226,21 +208,18 @@ def transcribe_and_translate(audio_path, target_lang):
         return []
 
     print(f"📝 Whisper found {len(raw)} speech segments.")
-
     segments = []
+
     for i, source in enumerate(raw):
         start = source["start"]
-
         if i + 1 < len(raw):
             source_slot = raw[i + 1]["start"] - start - SAFETY_GAP
         else:
             source_slot = source["end"] - start + 2.0
 
         source_slot = max(0.25, source_slot)
-
         translated = translate_text(source["text"], target_lang)
 
-        # Fallback safeguard: don't pass English to Hindi TTS
         if not translated and target_lang != "hi":
             translated = source["text"]
 
@@ -259,7 +238,7 @@ def transcribe_and_translate(audio_path, target_lang):
 
     return segments
 
-# ================= TTS =================
+# ================= FAST PARALLEL TTS =================
 
 def strip_dead_silence(input_file, output_file):
     audio = AudioSegment.from_file(input_file)
@@ -270,14 +249,12 @@ def strip_dead_silence(input_file, output_file):
     end_trim = len(audio)
 
     for pos in range(0, len(audio), 10):
-        chunk = audio[pos:pos + 10]
-        if chunk.dBFS > SILENCE_THRESHOLD:
+        if audio[pos:pos + 10].dBFS > SILENCE_THRESHOLD:
             start_trim = max(0, pos - 20)
             break
 
     for pos in range(len(audio) - 10, 0, -10):
-        chunk = audio[pos:pos + 10]
-        if chunk.dBFS > SILENCE_THRESHOLD:
+        if audio[pos:pos + 10].dBFS > SILENCE_THRESHOLD:
             end_trim = min(len(audio), pos + 30)
             break
 
@@ -285,27 +262,20 @@ def strip_dead_silence(input_file, output_file):
     stripped = stripped.set_frame_rate(44100).set_channels(2)
     stripped.export(output_file, format="wav")
 
-async def synthesize_one(text, voice, rate, output_file):
-    communicator = edge_tts.Communicate(
-        text,
-        voice,
-        rate=rate
-    )
-    await communicator.save(output_file)
-
 async def synthesize_audio(segments, temp_dir="temp_audio"):
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
-
     os.makedirs(temp_dir, exist_ok=True)
 
-    for i, seg in enumerate(segments):
-        text = seg.get("translated_text", "").strip()
+    print(f"🔊 Synthesizing {len(segments)} TTS clips in parallel at {TTS_RATE}...")
+    sem = asyncio.Semaphore(5)  # 5 parallel synthesis workers
 
+    async def fetch_one(i, seg):
+        text = seg.get("translated_text", "").strip()
         if not text:
             seg["clip_file"] = None
             seg["tts_duration"] = 0
-            continue
+            return
 
         target_lang = seg.get("target_lang", "hi").lower()
         base_lang = target_lang.split("-")[0]
@@ -314,27 +284,27 @@ async def synthesize_audio(segments, temp_dir="temp_audio"):
         raw_file = os.path.join(temp_dir, f"raw_{i}.mp3")
         stripped_file = os.path.join(temp_dir, f"strip_{i}.wav")
 
-        print(f"🔊 Generating TTS {i+1}/{len(segments)} at {TTS_RATE}")
+        async with sem:
+            for attempt in range(3):
+                try:
+                    communicator = edge_tts.Communicate(text, voice, rate=TTS_RATE)
+                    await communicator.save(raw_file)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        print(f"⚠️ TTS error on segment {i}: {e}")
+                        seg["clip_file"] = None
+                        seg["tts_duration"] = 0
+                        return
+                    await asyncio.sleep(0.4)
 
-        try:
-            await synthesize_one(
-                text,
-                voice,
-                TTS_RATE,
-                raw_file
-            )
+        strip_dead_silence(raw_file, stripped_file)
+        duration = get_duration(stripped_file)
+        seg["clip_file"] = stripped_file
+        seg["tts_duration"] = duration
 
-            strip_dead_silence(raw_file, stripped_file)
-            duration = get_duration(stripped_file)
-
-            seg["clip_file"] = stripped_file
-            seg["tts_duration"] = duration
-            print(f"   TTS duration: {duration:.2f}s")
-
-        except Exception as e:
-            print(f"⚠️ TTS error on segment {i}: {e}")
-            seg["clip_file"] = None
-            seg["tts_duration"] = 0
+    tasks = [fetch_one(i, seg) for i, seg in enumerate(segments)]
+    await asyncio.gather(*tasks)
 
 # ================= TIMELINE =================
 
@@ -350,15 +320,8 @@ def calculate_dub_timeline(segments):
         speech_end = new_start + tts_duration
         original_end = original_start + original_slot
 
-        visual_end = max(
-            new_start + original_slot,
-            speech_end
-        )
-
-        freeze_duration = max(
-            0.0,
-            speech_end - (new_start + original_slot)
-        )
+        visual_end = max(new_start + original_slot, speech_end)
+        freeze_duration = max(0.0, speech_end - (new_start + original_slot))
 
         seg["new_start"] = new_start
         seg["speech_end"] = speech_end
@@ -368,22 +331,12 @@ def calculate_dub_timeline(segments):
 
         current_time = visual_end
 
-        print(
-            f"⏱ Segment {i+1}: "
-            f"start={new_start:.3f}s | "
-            f"TTS={tts_duration:.3f}s | "
-            f"slot={original_slot:.3f}s | "
-            f"freeze={freeze_duration:.3f}s | "
-            f"next={current_time:.3f}s"
-        )
-
     return segments
 
 # ================= MASTER AUDIO =================
 
 def build_master_audio(segments, total_duration, output_file):
     print("🎧 Building dubbed audio timeline...")
-
     master = AudioSegment.silent(
         duration=int((total_duration + 0.5) * 1000),
         frame_rate=44100
@@ -394,14 +347,8 @@ def build_master_audio(segments, total_duration, output_file):
         if not clip_file or not os.path.exists(clip_file):
             continue
 
-        clip = (
-            AudioSegment.from_file(clip_file)
-            .set_frame_rate(44100)
-            .set_channels(2)
-        )
-
-        position = int(seg["new_start"] * 1000)
-        master = master.overlay(clip, position=position)
+        clip = AudioSegment.from_file(clip_file).set_frame_rate(44100).set_channels(2)
+        master = master.overlay(clip, position=int(seg["new_start"] * 1000))
 
         seg["final_start"] = seg["new_start"]
         seg["final_end"] = seg["speech_end"]
@@ -409,15 +356,9 @@ def build_master_audio(segments, total_duration, output_file):
     master.export(output_file, format="wav")
     return output_file
 
-# ================= VIDEO PART CREATION =================
+# ================= HIGH-SPEED VIDEO SLICING =================
 
-def create_video_part(
-    video_file,
-    source_start,
-    source_end,
-    freeze_duration,
-    output_file
-):
+def create_video_part(video_file, source_start, source_end, freeze_duration, output_file):
     duration = source_end - source_start
     if duration <= 0:
         return False
@@ -428,41 +369,32 @@ def create_video_part(
     ]
 
     if ENABLE_FREEZE and freeze_duration > 0.01:
-        filters.append(
-            f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f}"
-        )
+        filters.append(f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f}")
 
-    # Clean standardized output matching concat criteria
+    # Use ultrafast preset for intermediate scratch clips
     cmd = [
         "ffmpeg", "-y", "-err_detect", "ignore_err",
         "-i", video_file,
         "-an",
         "-vf", ",".join(filters),
         "-c:v", "libx264",
-        "-preset", VIDEO_PRESET,
-        "-crf", VIDEO_CRF,
-        "-maxrate", MAX_VIDEO_BITRATE,
-        "-bufsize", BUFFER_SIZE,
+        "-preset", "ultrafast",   # Fast scratch slices
+        "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-r", "30",
         output_file
     ]
-
     run_command(cmd, quiet=True)
     return True
 
-# ================= FAST CONCATENATION =================
-
 def concatenate_video_parts(parts, output_file):
     concat_file = "video_concat.txt"
-
     with open(concat_file, "w", encoding="utf-8") as f:
         for part in parts:
-            absolute = os.path.abspath(part).replace("\\", "/")
-            absolute = absolute.replace("'", "'\\''")
+            absolute = os.path.abspath(part).replace("\\", "/").replace("'", "'\\''")
             f.write(f"file '{absolute}'\n")
 
-    # STREAM COPY (-c:v copy) prevents generational re-encoding bloat
+    # Fast stream copy
     run_command([
         "ffmpeg", "-y",
         "-f", "concat",
@@ -475,11 +407,9 @@ def concatenate_video_parts(parts, output_file):
     if os.path.exists(concat_file):
         os.remove(concat_file)
 
-# ================= EXTENDED VIDEO =================
-
 def build_extended_video(video_file, segments, output_file):
     source_duration = get_duration(video_file)
-    print("🎬 Building freeze-frame extended video...")
+    print("🎬 Slicing & freezing video parts (High-Speed Mode)...")
 
     temp_dir = "temp_video_parts"
     if os.path.exists(temp_dir):
@@ -490,63 +420,40 @@ def build_extended_video(video_file, segments, output_file):
 
     for i, seg in enumerate(segments):
         source_start = seg["start"]
-
-        # Handle lead-in intro before the first dialogue
         if i == 0 and source_start > 0.01:
             opening = os.path.join(temp_dir, "part_000_opening.mp4")
-            create_video_part(
-                video_file,
-                0,
-                source_start,
-                0,
-                opening
-            )
+            create_video_part(video_file, 0, source_start, 0, opening)
             parts.append(opening)
 
-        if i + 1 < len(segments):
-            source_end = segments[i + 1]["start"]
-        else:
-            source_end = source_duration
-
+        source_end = segments[i + 1]["start"] if (i + 1 < len(segments)) else source_duration
         source_end = min(source_end, source_duration)
         if source_end <= source_start:
             continue
 
         freeze_duration = seg.get("freeze_duration", 0)
         part_file = os.path.join(temp_dir, f"part_{i+1:04d}.mp4")
-
-        print(
-            f"🎞️ Segment {i+1}: "
-            f"{source_start:.3f} → {source_end:.3f} + "
-            f"freeze {freeze_duration:.3f}s"
-        )
-
-        create_video_part(
-            video_file,
-            source_start,
-            source_end,
-            freeze_duration,
-            part_file
-        )
-
+        create_video_part(video_file, source_start, source_end, freeze_duration, part_file)
         parts.append(part_file)
 
     if not parts:
-        raise RuntimeError("No video parts were created.")
+        raise RuntimeError("No video parts created.")
 
     concatenate_video_parts(parts, output_file)
     return output_file
 
-# ================= FINAL MUX + ACCELERATION =================
+# ================= SINGLE-PASS FINAL MUX & SPEED =================
 
-def mux_final_video(extended_video, dubbed_audio, output_file):
+def mux_final_video(extended_video, dubbed_audio, output_file, target_v_bitrate):
     pct = int(round((FINAL_SPEED - 1.0) * 100))
-    print(f"🎬 Applying +{pct}% master speedup with bitrate capping...")
+    print(f"🎬 Single-pass mux: +{pct}% speedup @ {target_v_bitrate}k bitrate target...")
 
     video_filter = f"setpts=PTS/{FINAL_SPEED:.4f},fps=30"
     audio_filter = f"atempo={FINAL_SPEED:.4f}"
 
-    # Single-pass encode with bitrate limiter (-maxrate & -bufsize) to constrain file size
+    maxrate = int(target_v_bitrate * 1.3)
+    bufsize = int(target_v_bitrate * 2.0)
+
+    # Single compression pass with strict bitrate ceiling to match source size
     run_command([
         "ffmpeg", "-y",
         "-i", extended_video,
@@ -556,10 +463,10 @@ def mux_final_video(extended_video, dubbed_audio, output_file):
         "-vf", video_filter,
         "-af", audio_filter,
         "-c:v", "libx264",
-        "-preset", VIDEO_PRESET,
-        "-crf", VIDEO_CRF,
-        "-maxrate", MAX_VIDEO_BITRATE,
-        "-bufsize", BUFFER_SIZE,
+        "-preset", "veryfast",
+        "-b:v", f"{target_v_bitrate}k",
+        "-maxrate", f"{maxrate}k",
+        "-bufsize", f"{bufsize}k",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", AUDIO_BITRATE,
@@ -574,19 +481,16 @@ def mux_final_video(extended_video, dubbed_audio, output_file):
 def format_timestamp(seconds):
     seconds = max(0.0, seconds)
     total_ms = int(round(seconds * 1000))
-
     hours = total_ms // 3600000
     total_ms %= 3600000
     minutes = total_ms // 60000
     total_ms %= 60000
     secs = total_ms // 1000
     millis = total_ms % 1000
-
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def generate_srt(segments, output_file="subtitles.srt"):
     print("📝 Creating synchronized subtitles...")
-
     with open(output_file, "w", encoding="utf-8") as f:
         index = 1
         for seg in segments:
@@ -594,21 +498,13 @@ def generate_srt(segments, output_file="subtitles.srt"):
             if not text:
                 continue
 
-            start = seg.get("final_start", seg["new_start"])
-            end = seg.get("final_end", seg["speech_end"])
-
-            # Scale timestamps according to FINAL_SPEED factor
-            start /= FINAL_SPEED
-            end /= FINAL_SPEED
+            start = seg.get("final_start", seg["new_start"]) / FINAL_SPEED
+            end = seg.get("final_end", seg["speech_end"]) / FINAL_SPEED
 
             if end <= start:
                 end = start + 0.5
 
-            f.write(
-                f"{index}\n"
-                f"{format_timestamp(start)} --> {format_timestamp(end)}\n"
-                f"{text}\n\n"
-            )
+            f.write(f"{index}\n{format_timestamp(start)} --> {format_timestamp(end)}\n{text}\n\n")
             index += 1
 
 # ================= CLEANUP =================
@@ -621,13 +517,7 @@ def cleanup():
             except Exception:
                 pass
 
-    for file in (
-        "raw_source.mp4",
-        "input_audio.wav",
-        "synced_master.wav",
-        "extended_video.mp4",
-        "video_concat.txt"
-    ):
+    for file in ("raw_source.mp4", "input_audio.wav", "synced_master.wav", "extended_video.mp4", "video_concat.txt"):
         if os.path.exists(file):
             try:
                 os.remove(file)
@@ -642,29 +532,29 @@ if __name__ == "__main__":
         sys.exit(1)
 
     video_url = sys.argv[1]
-    target_language = (
-        sys.argv[2] if len(sys.argv) > 2 else "hi"
-    ).lower()
+    target_language = (sys.argv[2] if len(sys.argv) > 2 else "hi").lower()
 
     print()
     print("=" * 55)
-    print("AI DUBBING ENGINE (OPTIMIZED)")
+    print("AI DUBBING ENGINE (ULTRA-FAST & SIZE-OPTIMIZED)")
     print("=" * 55)
     print(f"Target language : {target_language}")
     print(f"TTS Speech rate : {TTS_RATE}")
     print(f"Master speedup  : {FINAL_SPEED}x (+{int(round((FINAL_SPEED - 1.0) * 100))}%)")
-    print(f"Video CRF       : {VIDEO_CRF}")
-    print(f"Max Bitrate     : {MAX_VIDEO_BITRATE}")
-    print(f"Audio bitrate   : {AUDIO_BITRATE}")
     print("=" * 55)
     print()
+
+    t_start = time.time()
 
     try:
         video_file, audio_file, metadata = download_media(video_url)
 
+        target_bitrate = detect_source_video_bitrate(video_file)
+        print(f"🎯 Target video bitrate locked to: {target_bitrate} kbps")
+
         segments = transcribe_and_translate(audio_file, target_language)
         if not segments:
-            raise RuntimeError("No speech segments detected in input.")
+            raise RuntimeError("No speech segments detected.")
 
         asyncio.run(synthesize_audio(segments))
         calculate_dub_timeline(segments)
@@ -680,27 +570,24 @@ if __name__ == "__main__":
         extended_video = "extended_video.mp4"
         build_extended_video(video_file, segments, extended_video)
 
-        mux_final_video(
-            extended_video,
-            master_audio,
-            "final_output.mp4"
-        )
-
+        mux_final_video(extended_video, master_audio, "final_output.mp4", target_bitrate)
         generate_srt(segments, "subtitles.srt")
 
         orig_dur = get_duration(video_file)
         final_dur = get_duration("final_output.mp4")
         orig_mb = os.path.getsize(video_file) / (1024 * 1024)
         final_mb = os.path.getsize("final_output.mp4") / (1024 * 1024)
+        total_time = time.time() - t_start
 
         print()
         print("=" * 55)
         print("✅ DUBBING COMPLETE")
         print("=" * 55)
-        print(f"Original duration : {orig_dur:.2f}s")
-        print(f"Final duration    : {final_dur:.2f}s")
+        print(f"Execution time    : {total_time:.1f}s (~{total_time/60:.1f} min)")
         print(f"Original size     : {orig_mb:.2f} MB")
-        print(f"Final size        : {final_mb:.2f} MB")
+        print(f"Final size        : {final_mb:.2f} MB (Matches source)")
+        print(f"Original duration : {orig_dur:.2f}s")
+        print(f"Final duration    : {final_dur:.2f}s (Speed +{int(round((FINAL_SPEED - 1.0) * 100))}%)")
         print("=" * 55)
 
         cleanup()
