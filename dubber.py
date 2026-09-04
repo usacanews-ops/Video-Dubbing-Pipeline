@@ -5,6 +5,7 @@ import asyncio
 import time
 import re
 import json
+import random
 import yt_dlp
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator, MyMemoryTranslator
@@ -41,13 +42,11 @@ def download_media(url: str) -> tuple[str, str, dict]:
             "tags": meta.get("tags", [])
         }
 
-    # Save metadata JSON for the cloud artifact release
     with open("source_meta.json", "w", encoding="utf-8") as mf:
         json.dump(meta_dict, mf, ensure_ascii=False)
 
     print(f"TITLE_EMIT: {meta_dict['title']}")
 
-    # Extract 16kHz Mono Audio for transcription
     subprocess.run([
         'ffmpeg', '-y', '-i', video_path,
         '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
@@ -61,8 +60,19 @@ def get_duration(file_path: str) -> float:
     return float(subprocess.check_output(cmd, shell=True).strip())
 
 # ==========================================
-# 2. 🎙️ Auto-Detection & Forced Translation
+# 2. 🛡️ Bulletproof Translation (Filters 500 Errors)
 # ==========================================
+def is_invalid_output(text: str) -> bool:
+    if not text:
+        return True
+    lowered = text.lower()
+    error_signatures = [
+        "server error", "500 (server error)", "!!1500", "please try again",
+        "<!doctype", "<html", "<head>", "that's all we know", "403 forbidden",
+        "unusual traffic", "captcha"
+    ]
+    return any(sig in lowered for sig in error_signatures)
+
 def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> str:
     clean_text = re.sub(r'[\r\n\t]+', ' ', text).strip()
     if not clean_text or len(clean_text) < 2:
@@ -71,22 +81,39 @@ def translate_text_enforced(text: str, source_lang: str, target_lang: str) -> st
     if source_lang == target_lang:
         return clean_text
 
-    # Attempt 1: Google Translate
+    # Attempt 1: Google Translator with Retry & Error Scrubbing
+    for attempt in range(2):
+        try:
+            res = GoogleTranslator(source='auto', target=target_lang).translate(clean_text)
+            if res and not is_invalid_output(res) and res.strip().lower() != clean_text.lower():
+                time.sleep(random.uniform(0.15, 0.35))
+                return res.strip()
+        except Exception:
+            time.sleep(0.5)
+
+    # Attempt 2: MyMemory Translator Fallback
     try:
-        res = GoogleTranslator(source='auto', target=target_lang).translate(clean_text)
-        if res and res.strip().lower() != clean_text.lower():
+        s_lang = source_lang if source_lang and source_lang != 'auto' else 'en'
+        res = MyMemoryTranslator(source=s_lang, target=target_lang).translate(clean_text)
+        if res and not is_invalid_output(res) and res.strip().lower() != clean_text.lower():
             return res.strip()
     except Exception:
         pass
 
-    # Attempt 2: MyMemory Translate
-    try:
-        res = MyMemoryTranslator(source=source_lang if source_lang != 'auto' else 'en', target=target_lang).translate(clean_text)
-        if res and res.strip().lower() != clean_text.lower():
-            return res.strip()
-    except Exception:
-        pass
+    # Attempt 3: Word-by-word chunking fallback if long
+    words = clean_text.split()
+    if len(words) > 3:
+        try:
+            half = len(words) // 2
+            p1 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[:half]))
+            p2 = GoogleTranslator(source='auto', target=target_lang).translate(" ".join(words[half:]))
+            combined = f"{p1} {p2}".strip()
+            if not is_invalid_output(combined):
+                return combined
+        except Exception:
+            pass
 
+    # Never pass an error page into audio synthesis
     return clean_text
 
 def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[dict]:
@@ -103,7 +130,6 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     if not raw_list:
         return []
 
-    # Merge tight adjacent segments
     merged = [raw_list[0]]
     for s in raw_list[1:]:
         prev = merged[-1]
@@ -119,7 +145,7 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     for s in merged:
         translated = translate_text_enforced(s["text"], detected_lang, target_lang)
 
-        if not first_preview_printed and translated:
+        if not first_preview_printed and translated and not is_invalid_output(translated):
             words = translated.strip().split()
             short_preview = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
             print(f"TRANSLATION_PREVIEW: {short_preview}")
@@ -154,8 +180,9 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
         elif lang == "de":
             voice = "de-DE-ConradNeural"
 
+        # Safety check: Prevent edge-tts from speaking raw code/error messages
         clean_tts_text = re.sub(r'[\[\]\(\)\{\}\<\>\"\'\*\#\@]', '', text).strip()
-        if not clean_tts_text:
+        if is_invalid_output(clean_tts_text) or not clean_tts_text:
             silent = AudioSegment.silent(duration=400)
             silent.export(audio_file, format="mp3")
             seg["audio_file"] = audio_file
@@ -163,7 +190,6 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             continue
 
         seg["audio_file"] = audio_file
-        # Faster rate (+18%) keeps video energetic and crisp
         try:
             communicate = edge_tts.Communicate(clean_tts_text, voice, rate="+18%")
             await communicate.save(audio_file)
@@ -180,7 +206,6 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
 def render_dubbed_video(video_path: str, segments: list[dict], output_file: str):
     orig_total_dur = get_duration(video_path)
 
-    # Calculate tight timeline with minimal inter-speech gaps
     timeline_cursor = 0.0
     for seg in segments:
         start_time = max(seg["orig_start"], timeline_cursor)
@@ -198,8 +223,6 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
     master_audio_path = "temp_master_audio.wav"
     master_audio.export(master_audio_path, format="wav")
 
-    # Overall Video Speed increase: 1.12x (12% faster video and audio)
-    # setpts=PTS/1.12 increases video speed; atempo=1.12 increases audio speed
     speed_factor = 1.12
     cmd = [
         'ffmpeg', '-y',
@@ -227,7 +250,6 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
 # 5. 📝 Subtitle (.srt) Generation
 # ==========================================
 def format_timestamp(seconds: float) -> str:
-    # Scale timestamps down by 1.12 to match sped-up video
     seconds = seconds / 1.12
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
@@ -240,7 +262,10 @@ def generate_srt(segments: list[dict], output_file: str = "subtitles.srt"):
         for i, seg in enumerate(segments, start=1):
             start_str = format_timestamp(seg["new_start"])
             end_str = format_timestamp(seg["new_end"])
-            f.write(f"{i}\n{start_str} --> {end_str}\n{seg['translated_text']}\n\n")
+            txt = seg['translated_text']
+            if is_invalid_output(txt):
+                txt = ""
+            f.write(f"{i}\n{start_str} --> {end_str}\n{txt}\n\n")
 
 if __name__ == "__main__":
     v_url = sys.argv[1]
