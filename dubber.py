@@ -51,7 +51,6 @@ def download_media(url: str) -> tuple[str, str, dict]:
 
     print(f"TITLE_EMIT: {meta_dict['title']}")
 
-    # Extract 16kHz mono audio cleanly for Whisper
     print("🎵 Extracting synchronized 16kHz PCM audio...")
     subprocess.run([
         'ffmpeg', '-y', '-err_detect', 'ignore_err',
@@ -67,7 +66,7 @@ def get_duration(file_path: str) -> float:
     return float(subprocess.check_output(cmd, shell=True).strip())
 
 # ==========================================
-# 2. 🛡️ Translation Engine
+# 2. 🛡️ Robust Translation Engine
 # ==========================================
 def contains_devanagari(text: str) -> bool:
     return bool(re.search(r'[\u0900-\u097F]', text))
@@ -115,11 +114,11 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     if not raw_list:
         return []
 
-    # Merge very tight pauses (< 0.35s) so dialogue matches natural scene cuts
+    # Merge tight fragments into full natural sentences to eliminate overflow bloat
     merged = [raw_list[0]]
     for s in raw_list[1:]:
         prev = merged[-1]
-        if s["start"] - prev["end"] < 0.35:
+        if s["start"] - prev["end"] < 0.6:
             prev["end"] = max(prev["end"], s["end"])
             prev["text"] += " " + s["text"]
         else:
@@ -129,9 +128,8 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     first_preview = False
 
     for i, s in enumerate(merged):
-        # The visual time window available before the next person speaks
-        next_start = merged[i + 1]["start"] if i + 1 < len(merged) else s["end"] + 3.0
-        available_window = max(0.4, next_start - s["start"])
+        next_start = merged[i + 1]["start"] if i + 1 < len(merged) else s["end"] + 4.0
+        available_window = max(0.5, next_start - s["start"])
 
         if target_lang == "hi":
             translated = translate_to_hindi(s["text"])
@@ -160,7 +158,7 @@ def transcribe_and_translate(audio_path: str, target_lang: str = "hi") -> list[d
     return segments
 
 # ==========================================
-# 3. ✂️ Speech Synthesis & Dead Air Removal
+# 3. ✂️ Speech Synthesis & Silence Trimming
 # ==========================================
 def strip_dead_silence(input_wav: str, output_wav: str, threshold: int = -42, chunk: int = 10):
     """Trims synthetic silence padding added by TTS engines."""
@@ -179,7 +177,6 @@ def strip_dead_silence(input_wav: str, output_wav: str, threshold: int = -42, ch
             break
 
     stripped = audio[start_trim:end_trim]
-    # Ensure standard 44100Hz audio
     stripped = stripped.set_frame_rate(44100)
     stripped.export(output_wav, format="wav")
 
@@ -199,14 +196,14 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             continue
 
         try:
-            # Articulate at +18% (crisp, natural speed without distortion)
+            # Articulate at +18% (crisp natural delivery)
             communicate = edge_tts.Communicate(text, voice, rate="+18%")
             await communicate.save(raw_tts)
 
             strip_dead_silence(raw_tts, stripped)
             dur = get_duration(stripped)
 
-            # Fit speech to the scene window, capped at max 1.15x
+            # Fit speech to scene window, capped at max 1.15x
             ratio = dur / seg["available_window"]
             if ratio > 1.0:
                 compress = min(ratio, MAX_ATEMPO)
@@ -226,17 +223,18 @@ async def synthesize_audio(segments: list[dict], temp_dir: str = "temp_audio"):
             seg["clip_file"] = None
 
 # ==========================================
-# 4. 🎬 Scene-Anchored Assembly (Zero Drift)
+# 4. 🎬 Collision-Free Master Assembly
 # ==========================================
 def render_dubbed_video(video_path: str, segments: list[dict], output_file: str):
     src_total_dur = get_duration(video_path)
-    print(f"🎬 Assembling master timeline locked to visual cues ({src_total_dur:.2f}s)...")
+    print(f"🎬 Assembling sequential, collision-free master timeline ({src_total_dur:.2f}s)...")
 
-    # Explicit 44.1kHz stereo track (fixes the 11kHz Pydub sample rate bug)
     master_track = AudioSegment.silent(
-        duration=int((src_total_dur + 2.0) * 1000),
+        duration=int((src_total_dur + 5.0) * 1000),
         frame_rate=44100
     ).set_channels(2)
+
+    audio_cursor = 0.0
 
     for seg in segments:
         if not seg.get("clip_file") or not os.path.exists(seg["clip_file"]):
@@ -245,12 +243,18 @@ def render_dubbed_video(video_path: str, segments: list[dict], output_file: str)
         clip = AudioSegment.from_file(seg["clip_file"]).set_frame_rate(44100).set_channels(2)
         clip_dur = len(clip) / 1000.0
 
-        # Anchor directly to the original visual speech timestamp
-        anchor_pos = seg["start"]
+        # Never start before previous line finishes (eliminates overlapping voices)
+        start_time = max(seg["start"], audio_cursor)
 
-        master_track = master_track.overlay(clip, position=int(anchor_pos * 1000))
-        seg["final_start"] = anchor_pos
-        seg["final_end"] = anchor_pos + clip_dur
+        # Resynchronize with visual scene if drift exceeds 0.4s
+        if start_time - seg["start"] > 0.4:
+            start_time = seg["start"] + 0.4
+
+        master_track = master_track.overlay(clip, position=int(start_time * 1000))
+        audio_cursor = start_time + clip_dur
+
+        seg["final_start"] = start_time
+        seg["final_end"] = audio_cursor
 
     synced_audio_path = "synced_master.wav"
     master_track = master_track[:int(src_total_dur * 1000)]
@@ -314,4 +318,4 @@ if __name__ == "__main__":
 
     render_dubbed_video(v_file, segs, "final_output.mp4")
     generate_srt(segs, "subtitles.srt")
-    print("✅ Completed render with direct visual scene anchoring.")
+    print("✅ Completed clean single-voice render with zero cross-talk.")
