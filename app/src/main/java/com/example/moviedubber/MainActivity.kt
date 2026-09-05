@@ -108,6 +108,10 @@ object DubberQueueManager {
     var queueSize by mutableStateOf(0)
     var historyList = mutableStateListOf<HistoryItem>()
 
+    // Reconnection tracking states
+    var activeRunId by mutableStateOf<Long?>(null)
+    var canReconnect by mutableStateOf(false)
+
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     fun loadHistory(context: Context) {
@@ -132,6 +136,14 @@ object DubberQueueManager {
             }
         } catch (e: Exception) {
             e.printStackTrace()
+        }
+
+        // Restore pending reconnect ID if last run was interrupted
+        val savedRunId = prefs.getLong("last_active_run_id", 0L)
+        if (savedRunId != 0L) {
+            activeRunId = savedRunId
+            canReconnect = true
+            currentStatus = "⚠️ Pending server task #$savedRunId. Tap Reconnect to check status."
         }
     }
 
@@ -183,6 +195,7 @@ object DubberQueueManager {
         val nextItem = queue.poll() ?: return
         queueSize = queue.size
         isProcessing = true
+        canReconnect = false
 
         val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
         val owner = prefs.getString("owner", "usacanews-ops") ?: ""
@@ -208,13 +221,61 @@ object DubberQueueManager {
                 },
                 onComplete = { _, _ ->
                     isProcessing = false
+                    canReconnect = false
+                    activeRunId = null
+                    prefs.edit().remove("last_active_run_id").apply()
                     currentStatus = "🎉 Dubbing complete! Ready to schedule or upload."
                     processNext(context)
                 },
                 onError = { err ->
                     isProcessing = false
-                    currentStatus = "❌ Error: $err"
+                    canReconnect = (activeRunId != null)
+                    currentStatus = "❌ Connection failed: $err. Tap Reconnect to sync."
                     processNext(context)
+                }
+            )
+        }
+    }
+
+    // Reconnect to a previously started or interrupted task
+    fun reconnect(context: Context) {
+        val runId = activeRunId ?: return
+        if (isProcessing) return
+        isProcessing = true
+        canReconnect = false
+
+        val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
+        val owner = prefs.getString("owner", "usacanews-ops") ?: ""
+        val repo = prefs.getString("repo", "Video-Dubbing-Pipeline") ?: ""
+        val token = prefs.getString("token", "") ?: ""
+
+        coroutineScope.launch {
+            monitorCloudRun(
+                context = context,
+                owner = owner.trim(),
+                repo = repo.trim(),
+                token = token.trim(),
+                runId = runId,
+                onStatusUpdate = { status, log, preview ->
+                    currentStatus = status
+                    detailedLogs = log
+                    if (preview.isNotBlank()) {
+                        val words = preview.trim().split(Regex("\\s+"))
+                        firstLinePreview = if (words.size > 5) words.take(5).joinToString(" ") + "..." else preview
+                    }
+                },
+                onComplete = { _, _ ->
+                    isProcessing = false
+                    canReconnect = false
+                    activeRunId = null
+                    prefs.edit().remove("last_active_run_id").apply()
+                    currentStatus = "🎉 Dubbing complete! Ready to schedule or upload."
+                    processNext(context)
+                },
+                onError = { err ->
+                    isProcessing = false
+                    canReconnect = true
+                    currentStatus = "❌ Reconnect attempt failed: $err. Tap Reconnect to try again."
                 }
             )
         }
@@ -434,6 +495,7 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(6.dp))
 
+        // Custom Reel Title with "✕" (Clear) Trailing Button
         OutlinedTextField(
             value = customTitle,
             onValueChange = {
@@ -443,7 +505,19 @@ fun DubberLiveApp() {
             label = { Text("Custom Reel Title (Tap a title below to fill)") },
             placeholder = { Text("Movie Explained in Hindi") },
             modifier = Modifier.fillMaxWidth(),
-            singleLine = true
+            singleLine = true,
+            trailingIcon = {
+                if (customTitle.isNotEmpty()) {
+                    IconButton(
+                        onClick = {
+                            customTitle = ""
+                            prefs.edit().putString("custom_title", "").apply()
+                        }
+                    ) {
+                        Text("✕", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
+                    }
+                }
+            }
         )
 
         Spacer(modifier = Modifier.height(6.dp))
@@ -520,7 +594,7 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Live Download/Buffering & Upload Progress Indicator
+        // Live Upload Tracking to Meta
         if (isUploadingToFb) {
             Card(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -537,6 +611,7 @@ fun DubberLiveApp() {
             }
         }
 
+        // Live Status Card + Reconnect Button
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(8.dp),
@@ -562,6 +637,23 @@ fun DubberLiveApp() {
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                     )
                 }
+
+                // Dedicated Reconnect Action Button when mobile network drops
+                if (DubberQueueManager.canReconnect && DubberQueueManager.activeRunId != null) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Button(
+                        onClick = { DubberQueueManager.reconnect(context) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00796B)),
+                        modifier = Modifier.fillMaxWidth().height(40.dp)
+                    ) {
+                        Text(
+                            "🔄 Reconnect to Task #${DubberQueueManager.activeRunId}",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    }
+                }
             }
         }
 
@@ -584,7 +676,6 @@ fun DubberLiveApp() {
 
             Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 DubberQueueManager.historyList.forEach { history ->
-                    // Local state for each card's schedule minutes
                     var cardScheduleMinutes by remember { mutableStateOf("0") }
 
                     Card(
@@ -670,7 +761,7 @@ fun DubberLiveApp() {
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            // Dedicated Schedule Input Box on this card
+                            // Schedule Input Box
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -781,6 +872,11 @@ fun DubberLiveApp() {
                                                         isUploadingToFb = false
                                                         history.isUploaded = true
                                                         DubberQueueManager.saveHistory(context)
+
+                                                        // AUTO EMPTY TITLE BOX AFTER SUCCESSFUL UPLOAD
+                                                        customTitle = ""
+                                                        prefs.edit().putString("custom_title", "").apply()
+
                                                         val msg = if (scheduleUnix != null) "📅 Scheduled successfully for +$schedMins mins!" else "🎉 Published directly to FB!"
                                                         Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
                                                     },
@@ -828,7 +924,7 @@ fun DubberLiveApp() {
 }
 
 // =========================================================================
-// 🚀 Cloud Pipeline Orchestrator (Agnostic Terminology)
+// 🚀 Cloud Pipeline Orchestrator with Persistent Monitoring & Resumption
 // =========================================================================
 suspend fun executeCloudDubbingPipeline(
     context: Context,
@@ -844,6 +940,7 @@ suspend fun executeCloudDubbingPipeline(
 ) = withContext(Dispatchers.IO) {
     val client = OkHttpClient()
     val authHeader = "Bearer $token"
+    val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
 
     try {
         onStatusUpdate("⚡ Dispatching task...", "Connecting to cloud worker pipeline...", "")
@@ -895,18 +992,52 @@ suspend fun executeCloudDubbingPipeline(
             return@withContext
         }
 
-        var isDone = false
-        var runConclusion = ""
-        var extractedPreview = ""
-        var emittedTitle = "Dubbed Video"
+        // Save active run ID to disk for reconnection
+        DubberQueueManager.activeRunId = runId
+        prefs.edit().putLong("last_active_run_id", runId).apply()
 
-        while (!isDone) {
-            delay(3500)
+        // Delegate to resilient monitoring loop
+        monitorCloudRun(context, owner, repo, token, runId, onStatusUpdate, onComplete, onError)
+
+    } catch (e: Exception) {
+        withContext(Dispatchers.Main) {
+            onError(e.localizedMessage ?: "Processing error")
+        }
+    }
+}
+
+// Resilient polling monitor with automatic retry on network drops
+suspend fun monitorCloudRun(
+    context: Context,
+    owner: String,
+    repo: String,
+    token: String,
+    runId: Long,
+    onStatusUpdate: (String, String, String) -> Unit,
+    onComplete: (String, String) -> Unit,
+    onError: (String) -> Unit
+) = withContext(Dispatchers.IO) {
+    val client = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .build()
+    val authHeader = "Bearer $token"
+
+    var isDone = false
+    var runConclusion = ""
+    var extractedPreview = ""
+    var emittedTitle = "Dubbed Video"
+    var consecutiveNetworkErrors = 0
+
+    while (!isDone) {
+        delay(3500)
+        try {
             val jobUrl = "https://api.github.com/repos/$owner/$repo/actions/runs/$runId/jobs"
             val jobReq = Request.Builder().url(jobUrl).addHeader("Authorization", authHeader).build()
             val jobRes = client.newCall(jobReq).execute()
 
             if (jobRes.isSuccessful) {
+                consecutiveNetworkErrors = 0
                 val jobJson = JSONObject(jobRes.body?.string() ?: "")
                 val jobs = jobJson.optJSONArray("jobs")
                 if (jobs != null && jobs.length() > 0) {
@@ -955,75 +1086,89 @@ suspend fun executeCloudDubbingPipeline(
                         runConclusion = conclusion
                     }
                 }
+            } else {
+                consecutiveNetworkErrors++
+                if (consecutiveNetworkErrors > 6) {
+                    withContext(Dispatchers.Main) { onError("Server returned HTTP ${jobRes.code}") }
+                    return@withContext
+                }
+            }
+        } catch (e: Exception) {
+            consecutiveNetworkErrors++
+            if (consecutiveNetworkErrors <= 6) {
+                // Auto-retry mobile connection drop silently before giving up
+                onStatusUpdate("📡 Signal weak. Reconnecting ($consecutiveNetworkErrors/6)...", "Network timeout, retrying...", "")
+                delay(3000)
+                continue
+            } else {
+                withContext(Dispatchers.Main) {
+                    onError("Network connection lost: ${e.localizedMessage}")
+                }
+                return@withContext
             }
         }
+    }
 
-        if (runConclusion != "success") {
-            onError("Task completed with code: $runConclusion")
-            return@withContext
-        }
+    if (runConclusion != "success") {
+        withContext(Dispatchers.Main) { onError("Task completed with status: $runConclusion") }
+        return@withContext
+    }
 
-        onStatusUpdate("🔗 Fetching cloud assets...", "Assembling media package...", extractedPreview)
-        delay(2000)
+    onStatusUpdate("🔗 Fetching cloud assets...", "Assembling media package...", extractedPreview)
+    delay(2000)
 
-        val releaseUrl = "https://api.github.com/repos/$owner/$repo/releases/latest"
-        val relReq = Request.Builder().url(releaseUrl).addHeader("Authorization", authHeader).build()
-        val relRes = client.newCall(relReq).execute()
+    val releaseUrl = "https://api.github.com/repos/$owner/$repo/releases/latest"
+    val relReq = Request.Builder().url(releaseUrl).addHeader("Authorization", authHeader).build()
+    val relRes = client.newCall(relReq).execute()
 
-        var videoDownloadUrl = ""
-        var srtDownloadUrl = ""
-        var sourceMetadataJson = ""
+    var videoDownloadUrl = ""
+    var srtDownloadUrl = ""
+    var sourceMetadataJson = ""
 
-        if (relRes.isSuccessful) {
-            val relJson = JSONObject(relRes.body?.string() ?: "")
-            val assets = relJson.optJSONArray("assets")
-            if (assets != null) {
-                for (k in 0 until assets.length()) {
-                    val asset = assets.getJSONObject(k)
-                    val name = asset.getString("name")
-                    if (name.endsWith(".mp4") || name == "final_output.mp4") {
-                        videoDownloadUrl = asset.getString("browser_download_url")
-                    } else if (name.endsWith(".srt") || name == "subtitles.srt") {
-                        srtDownloadUrl = asset.getString("browser_download_url")
-                    } else if (name == "source_meta.json") {
-                        try {
-                            val mfReq = Request.Builder().url(asset.getString("browser_download_url")).addHeader("Authorization", authHeader).build()
-                            val mfRes = client.newCall(mfReq).execute()
-                            val mfStr = mfRes.body?.string() ?: ""
-                            val parsed = JSONObject(mfStr)
-                            emittedTitle = parsed.optString("title", emittedTitle)
-                            sourceMetadataJson = "TITLE:\n${parsed.optString("title")}\n\nTAGS:\n${parsed.optJSONArray("tags")}\n\nDESCRIPTION:\n${parsed.optString("description")}"
-                        } catch (_: Exception) {}
-                    }
+    if (relRes.isSuccessful) {
+        val relJson = JSONObject(relRes.body?.string() ?: "")
+        val assets = relJson.optJSONArray("assets")
+        if (assets != null) {
+            for (k in 0 until assets.length()) {
+                val asset = assets.getJSONObject(k)
+                val name = asset.getString("name")
+                if (name.endsWith(".mp4") || name == "final_output.mp4") {
+                    videoDownloadUrl = asset.getString("browser_download_url")
+                } else if (name.endsWith(".srt") || name == "subtitles.srt") {
+                    srtDownloadUrl = asset.getString("browser_download_url")
+                } else if (name == "source_meta.json") {
+                    try {
+                        val mfReq = Request.Builder().url(asset.getString("browser_download_url")).addHeader("Authorization", authHeader).build()
+                        val mfRes = client.newCall(mfReq).execute()
+                        val mfStr = mfRes.body?.string() ?: ""
+                        val parsed = JSONObject(mfStr)
+                        emittedTitle = parsed.optString("title", emittedTitle)
+                        sourceMetadataJson = "TITLE:\n${parsed.optString("title")}\n\nTAGS:\n${parsed.optJSONArray("tags")}\n\nDESCRIPTION:\n${parsed.optString("description")}"
+                    } catch (_: Exception) {}
                 }
             }
         }
+    }
 
-        if (videoDownloadUrl.isBlank()) {
-            videoDownloadUrl = "https://github.com/$owner/$repo/actions/runs/$runId"
-        }
+    if (videoDownloadUrl.isBlank()) {
+        videoDownloadUrl = "https://github.com/$owner/$repo/actions/runs/$runId"
+    }
 
-        val timeStr = SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()).format(Date())
-        withContext(Dispatchers.Main) {
-            DubberQueueManager.addHistoryItem(
-                context,
-                HistoryItem(
-                    id = runId.toString(),
-                    title = emittedTitle,
-                    downloadUrl = videoDownloadUrl,
-                    srtUrl = srtDownloadUrl,
-                    timestamp = timeStr,
-                    sourceMetaText = sourceMetadataJson,
-                    isUploaded = false
-                )
+    val timeStr = SimpleDateFormat("MMM dd, HH:mm", Locale.getDefault()).format(Date())
+    withContext(Dispatchers.Main) {
+        DubberQueueManager.addHistoryItem(
+            context,
+            HistoryItem(
+                id = runId.toString(),
+                title = emittedTitle,
+                downloadUrl = videoDownloadUrl,
+                srtUrl = srtDownloadUrl,
+                timestamp = timeStr,
+                sourceMetaText = sourceMetadataJson,
+                isUploaded = false
             )
-            onComplete(videoDownloadUrl, srtDownloadUrl)
-        }
-
-    } catch (e: Exception) {
-        withContext(Dispatchers.Main) {
-            onError(e.localizedMessage ?: "Processing error")
-        }
+        )
+        onComplete(videoDownloadUrl, srtDownloadUrl)
     }
 }
 
