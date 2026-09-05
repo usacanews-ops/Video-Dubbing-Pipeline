@@ -1,5 +1,6 @@
 package com.example.moviedubber
 
+import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -15,7 +16,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -25,6 +25,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -32,7 +33,6 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.Buffer
 import okio.BufferedSink
@@ -43,7 +43,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.*
@@ -446,7 +445,6 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Title Input with 'X' Clear Button
         OutlinedTextField(
             value = customTitle,
             onValueChange = {
@@ -557,7 +555,7 @@ fun DubberLiveApp() {
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     LinearProgressIndicator(
-                        progress = { fbUploadPercent / 100f },
+                        progress = fbUploadPercent / 100f,
                         modifier = Modifier.fillMaxWidth().height(8.dp),
                     )
                     Spacer(modifier = Modifier.height(4.dp))
@@ -571,7 +569,6 @@ fun DubberLiveApp() {
             }
         }
 
-        // Processing Pipeline Status Box with Retry Trigger
         Card(
             modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
@@ -594,7 +591,6 @@ fun DubberLiveApp() {
                     )
                 }
 
-                // Show manual retry button if connection dropped
                 if (!DubberQueueManager.isProcessing && DubberQueueManager.lastFailedItem != null) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(
@@ -627,7 +623,7 @@ fun DubberLiveApp() {
                         Text(
                             text = DubberQueueManager.detailedLogs,
                             fontSize = 10.sp,
-                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                            fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.onSecondaryContainer
                         )
                     }
@@ -751,7 +747,6 @@ fun DubberLiveApp() {
                                                 item.isUploaded = true
                                                 DubberQueueManager.saveHistory(context)
                                                 
-                                                // Auto-clear title on upload success
                                                 customTitle = ""
                                                 prefs.edit().putString("custom_title", "").apply()
                                                 
@@ -792,6 +787,7 @@ fun DubberLiveApp() {
 // -------------------------------------------------------------------------------------
 // Network State Verification
 // -------------------------------------------------------------------------------------
+@SuppressLint("MissingPermission")
 fun isNetworkAvailable(context: Context): Boolean {
     val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return true
     val activeNet = cm.activeNetwork ?: return false
@@ -800,7 +796,7 @@ fun isNetworkAvailable(context: Context): Boolean {
 }
 
 // -------------------------------------------------------------------------------------
-// Robust HTTP Request with Auto Reconnect while travelling
+// Robust HTTP Request with Auto Reconnect
 // -------------------------------------------------------------------------------------
 suspend fun executeWithRetry(
     context: Context,
@@ -854,7 +850,6 @@ suspend fun executeCloudDubbingPipeline(
     try {
         onStatusUpdate("Triggering remote cloud worker...", "", "")
 
-        // 1. Dispatch Repository Workflow with auto-reconnect
         val dispatchUrl = "https://api.github.com/repos/$owner/$repo/dispatches"
         val payload = JSONObject().apply {
             put("event_type", "run_dubber")
@@ -883,7 +878,6 @@ suspend fun executeCloudDubbingPipeline(
 
         delay(8000)
 
-        // 2. Poll for the latest workflow run ID
         var runId: Long? = null
         val runsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs?event=repository_dispatch&per_page=1"
 
@@ -915,7 +909,6 @@ suspend fun executeCloudDubbingPipeline(
             return@withContext
         }
 
-        // 3. Poll Workflow Run Status
         val checkUrl = "https://api.github.com/repos/$owner/$repo/actions/runs/$runId"
         var isFinished = false
         var currentTitle = "Dubbed Video"
@@ -954,7 +947,6 @@ suspend fun executeCloudDubbingPipeline(
             }
         }
 
-        // 4. Retrieve Published Output Artifacts
         val artifactsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs/$runId/artifacts"
         var downloadUrl = ""
 
@@ -1023,7 +1015,6 @@ suspend fun uploadVideoToFacebookReel(
     try {
         onProgress("Buffering video stream...", 10)
 
-        // 1. Download file to local cache with retry
         tempFile = File(context.cacheDir, "fb_upload_${System.currentTimeMillis()}.mp4")
         val getReq = Request.Builder().url(videoUrl).build()
 
@@ -1051,7 +1042,6 @@ suspend fun uploadVideoToFacebookReel(
 
         onProgress("Initializing Reel upload session...", 50)
 
-        // 2. Initialize Resumable Reels Session on Facebook Graph API
         val initUrl = "https://graph.facebook.com/v19.0/${pageAccount.id}/video_reels"
         val initPayload = FormBody.Builder()
             .add("upload_phase", "start")
@@ -1069,7 +1059,6 @@ suspend fun uploadVideoToFacebookReel(
 
         onProgress("Uploading video binary...", 55)
 
-        // 3. Upload the Video Binary
         val progressBody = ProgressRequestBody(
             file = tempFile,
             contentType = "application/octet-stream".toMediaType(),
@@ -1095,7 +1084,6 @@ suspend fun uploadVideoToFacebookReel(
 
         onProgress("Publishing Reel metadata...", 95)
 
-        // 4. Finish and Publish Reel
         val finishPayload = FormBody.Builder()
             .add("upload_phase", "finish")
             .add("access_token", pageAccount.token)
