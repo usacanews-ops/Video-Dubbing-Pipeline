@@ -9,6 +9,10 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -21,8 +25,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -47,6 +54,16 @@ import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
+
+// --- Modern Lively Color Palette ---
+val PrimaryIndigo = Color(0xFF4F46E5)
+val AccentCyan = Color(0xFF06B6D4)
+val EmeraldSuccess = Color(0xFF10B981)
+val CoralError = Color(0xFFEF4444)
+val AmberWarning = Color(0xFFF59E0B)
+val SurfaceCanvas = Color(0xFFF8FAFC)
+val CardBackground = Color(0xFFFFFFFF)
+val TextMuted = Color(0xFF64748B)
 
 data class FacebookPageAccount(
     val name: String,
@@ -102,7 +119,7 @@ class ProgressRequestBody(
 object DubberQueueManager {
     val queue = ConcurrentLinkedQueue<QueueItem>()
     var isProcessing by mutableStateOf(false)
-    var currentStatus by mutableStateOf("Ready")
+    var currentStatus by mutableStateOf("Ready to dub")
     var detailedLogs by mutableStateOf("")
     var firstLinePreview by mutableStateOf("")
     var queueSize by mutableStateOf(0)
@@ -111,6 +128,7 @@ object DubberQueueManager {
     // Reconnection tracking states
     var activeRunId by mutableStateOf<Long?>(null)
     var canReconnect by mutableStateOf(false)
+    var hasCloudError by mutableStateOf(false)
 
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -138,12 +156,12 @@ object DubberQueueManager {
             e.printStackTrace()
         }
 
-        // Restore pending reconnect ID if last run was interrupted
         val savedRunId = prefs.getLong("last_active_run_id", 0L)
         if (savedRunId != 0L) {
             activeRunId = savedRunId
             canReconnect = true
-            currentStatus = "⚠️ Pending server task #$savedRunId. Tap Reconnect to check status."
+            hasCloudError = true
+            currentStatus = "Cloud Connectivity Error."
         }
     }
 
@@ -196,6 +214,7 @@ object DubberQueueManager {
         queueSize = queue.size
         isProcessing = true
         canReconnect = false
+        hasCloudError = false
 
         val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
         val owner = prefs.getString("owner", "usacanews-ops") ?: ""
@@ -222,27 +241,30 @@ object DubberQueueManager {
                 onComplete = { _, _ ->
                     isProcessing = false
                     canReconnect = false
+                    hasCloudError = false
                     activeRunId = null
                     prefs.edit().remove("last_active_run_id").apply()
-                    currentStatus = "🎉 Dubbing complete! Ready to schedule or upload."
+                    currentStatus = "🎉 Dubbing complete! Ready to schedule."
                     processNext(context)
                 },
-                onError = { err ->
+                onError = { _ ->
                     isProcessing = false
                     canReconnect = (activeRunId != null)
-                    currentStatus = "❌ Connection failed: $err. Tap Reconnect to sync."
+                    hasCloudError = true
+                    currentStatus = "Cloud Connectivity Error."
                     processNext(context)
                 }
             )
         }
     }
 
-    // Reconnect to a previously started or interrupted task
     fun reconnect(context: Context) {
         val runId = activeRunId ?: return
         if (isProcessing) return
         isProcessing = true
         canReconnect = false
+        hasCloudError = false
+        currentStatus = "Re-establishing connection..."
 
         val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
         val owner = prefs.getString("owner", "usacanews-ops") ?: ""
@@ -267,15 +289,17 @@ object DubberQueueManager {
                 onComplete = { _, _ ->
                     isProcessing = false
                     canReconnect = false
+                    hasCloudError = false
                     activeRunId = null
                     prefs.edit().remove("last_active_run_id").apply()
-                    currentStatus = "🎉 Dubbing complete! Ready to schedule or upload."
+                    currentStatus = "🎉 Dubbing complete! Ready to schedule."
                     processNext(context)
                 },
-                onError = { err ->
+                onError = { _ ->
                     isProcessing = false
                     canReconnect = true
-                    currentStatus = "❌ Reconnect attempt failed: $err. Tap Reconnect to try again."
+                    hasCloudError = true
+                    currentStatus = "Cloud Connectivity Error."
                 }
             )
         }
@@ -290,8 +314,18 @@ class MainActivity : ComponentActivity() {
         handleIncomingShare(intent)
 
         setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            MaterialTheme(
+                colorScheme = lightColorScheme(
+                    primary = PrimaryIndigo,
+                    secondary = AccentCyan,
+                    surface = CardBackground,
+                    background = SurfaceCanvas
+                )
+            ) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
                     DubberLiveApp()
                 }
             }
@@ -371,46 +405,57 @@ fun DubberLiveApp() {
         mutableStateOf(pageAccounts.firstOrNull())
     }
 
-    // Selectable & Copyable Metadata Dialog
+    // Selectable Metadata Dialog
     activeMetadataDialog?.let { metaText ->
         AlertDialog(
             onDismissRequest = { activeMetadataDialog = null },
-            title = { Text("ℹ️ Source Video Metadata", fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("ℹ️", fontSize = 18.sp)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Source Video Metadata", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                }
+            },
             text = {
                 Card(
                     modifier = Modifier.fillMaxWidth().height(260.dp),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9))
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(10.dp)
+                            .padding(12.dp)
                             .verticalScroll(rememberScrollState())
                     ) {
                         SelectionContainer {
                             Text(
                                 text = metaText,
                                 fontSize = 12.sp,
-                                lineHeight = 16.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                lineHeight = 17.sp,
+                                color = Color(0xFF334155),
+                                fontFamily = FontFamily.Monospace
                             )
                         }
                     }
                 }
             },
             confirmButton = {
-                Button(onClick = {
-                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("Source Metadata", metaText))
-                    Toast.makeText(context, "📋 All metadata copied!", Toast.LENGTH_SHORT).show()
-                    activeMetadataDialog = null
-                }) {
+                Button(
+                    onClick = {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Source Metadata", metaText))
+                        Toast.makeText(context, "📋 Metadata copied to clipboard", Toast.LENGTH_SHORT).show()
+                        activeMetadataDialog = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo)
+                ) {
                     Text("📋 Copy All")
                 }
             },
             dismissButton = {
                 TextButton(onClick = { activeMetadataDialog = null }) {
-                    Text("Close")
+                    Text("Close", color = TextMuted)
                 }
             }
         )
@@ -419,66 +464,99 @@ fun DubberLiveApp() {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp)
             .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
+        // App Top Bar
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Column {
-                Text("🎬 AI Movie Dubber", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-                if (DubberQueueManager.queueSize > 0 || DubberQueueManager.isProcessing) {
-                    Text(
-                        "Queue: ${DubberQueueManager.queueSize} waiting | Active: ${if (DubberQueueManager.isProcessing) "1" else "0"}",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.primary,
-                        fontWeight = FontWeight.SemiBold
+                Text(
+                    "🎬 MovieDubber AI",
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = Color(0xFF0F172A)
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .clip(CircleShape)
+                            .background(if (DubberQueueManager.isProcessing) AmberWarning else EmeraldSuccess)
                     )
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text(
+                        if (DubberQueueManager.isProcessing) "Engine Working" else "Ready",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = TextMuted
+                    )
+                    if (DubberQueueManager.queueSize > 0) {
+                        Text(
+                            " • Queue: ${DubberQueueManager.queueSize}",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = PrimaryIndigo
+                        )
+                    }
                 }
             }
-            TextButton(onClick = { showSettings = !showSettings }) {
-                Text(if (showSettings) "Close Config" else "⚙️ Config")
+
+            FilledTonalButton(
+                onClick = { showSettings = !showSettings },
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                Text(if (showSettings) "✕ Close" else "⚙️ Settings", fontSize = 12.sp)
             }
         }
 
-        if (showSettings) {
+        // Settings Expandable Card
+        AnimatedVisibility(visible = showSettings) {
             Card(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFF1F5F9))
             ) {
                 Column(modifier = Modifier.padding(14.dp)) {
-                    Text("Cloud Engine Settings", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Text("Cloud Engine Configuration", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF1E293B))
+                    Spacer(modifier = Modifier.height(6.dp))
                     OutlinedTextField(
                         value = cloudWorkspace,
                         onValueChange = { cloudWorkspace = it; prefs.edit().putString("owner", it).apply() },
                         label = { Text("Workspace / User") },
                         modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
+                        singleLine = true,
+                        shape = RoundedCornerShape(10.dp)
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
                     OutlinedTextField(
                         value = cloudRepository,
                         onValueChange = { cloudRepository = it; prefs.edit().putString("repo", it).apply() },
                         label = { Text("Pipeline Service Name") },
                         modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
+                        singleLine = true,
+                        shape = RoundedCornerShape(10.dp)
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
                     OutlinedTextField(
                         value = cloudServerKey,
                         onValueChange = { cloudServerKey = it; prefs.edit().putString("token", it).apply() },
-                        label = { Text("Pipeline Server Access Key") },
+                        label = { Text("Pipeline Access Token") },
                         modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
+                        singleLine = true,
+                        shape = RoundedCornerShape(10.dp)
                     )
-
                     Spacer(modifier = Modifier.height(10.dp))
-                    Text("Facebook Pages (1 per line)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                    Text("Format: PageName|PageID|PageToken", fontSize = 11.sp, color = Color.Gray)
+                    Text("Facebook Pages (Name|PageID|Token)", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF1E293B))
                     Spacer(modifier = Modifier.height(4.dp))
                     OutlinedTextField(
                         value = fbPagesRaw,
@@ -487,7 +565,8 @@ fun DubberLiveApp() {
                             prefs.edit().putString("fb_pages_raw", it).apply()
                         },
                         modifier = Modifier.fillMaxWidth(),
-                        minLines = 3
+                        minLines = 2,
+                        shape = RoundedCornerShape(10.dp)
                     )
                 }
             }
@@ -495,17 +574,18 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Custom Reel Title with "✕" (Clear) Trailing Button
+        // Title Input Box with Cross "✕" Button & Updated Placeholder
         OutlinedTextField(
             value = customTitle,
             onValueChange = {
                 customTitle = it
                 prefs.edit().putString("custom_title", it).apply()
             },
-            label = { Text("Custom Reel Title (Tap a title below to fill)") },
-            placeholder = { Text("Movie Explained in Hindi") },
+            label = { Text("Title (Tap below to fill)") },
+            placeholder = { Text("Title (Tap below to fill)") },
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,
+            shape = RoundedCornerShape(12.dp),
             trailingIcon = {
                 if (customTitle.isNotEmpty()) {
                     IconButton(
@@ -514,7 +594,15 @@ fun DubberLiveApp() {
                             prefs.edit().putString("custom_title", "").apply()
                         }
                     ) {
-                        Text("✕", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
+                        Box(
+                            modifier = Modifier
+                                .size(20.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFE2E8F0)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("✕", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF475569))
+                        }
                     }
                 }
             }
@@ -530,7 +618,8 @@ fun DubberLiveApp() {
             },
             label = { Text("Custom #Tags") },
             modifier = Modifier.fillMaxWidth(),
-            singleLine = true
+            singleLine = true,
+            shape = RoundedCornerShape(12.dp)
         )
 
         Spacer(modifier = Modifier.height(8.dp))
@@ -540,28 +629,35 @@ fun DubberLiveApp() {
             onValueChange = { videoUrl = it },
             label = { Text("Paste Video Link (FB / YouTube)") },
             modifier = Modifier.fillMaxWidth(),
-            singleLine = true
+            singleLine = true,
+            shape = RoundedCornerShape(12.dp)
         )
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
-        Text("Target Dubbing Language", modifier = Modifier.align(Alignment.Start), fontSize = 13.sp)
+        // Language Filter Chips
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Target Language", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextMuted)
+        }
         Spacer(modifier = Modifier.height(4.dp))
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             listOf(
-                "hi" to "Hindi",
-                "en" to "English (Re-voice)",
-                "es" to "Spanish",
-                "fr" to "French",
-                "de" to "German",
-                "it" to "Italian",
-                "pt" to "Portuguese",
-                "ja" to "Japanese"
+                "hi" to "Hindi 🇮🇳",
+                "en" to "English 🇺🇸",
+                "es" to "Spanish 🇪🇸",
+                "fr" to "French 🇫🇷",
+                "de" to "German 🇩🇪",
+                "it" to "Italian 🇮🇹",
+                "pt" to "Portuguese 🇧🇷",
+                "ja" to "Japanese 🇯🇵"
             ).forEach { (code, name) ->
                 FilterChip(
                     selected = selectedLanguage == code,
@@ -569,13 +665,15 @@ fun DubberLiveApp() {
                         selectedLanguage = code
                         prefs.edit().putString("default_lang", code).apply()
                     },
-                    label = { Text(name, fontSize = 12.sp, maxLines = 1) }
+                    label = { Text(name, fontSize = 12.sp) },
+                    shape = RoundedCornerShape(8.dp)
                 )
             }
         }
 
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
+        // Main Action Button
         Button(
             onClick = {
                 if (videoUrl.isNotBlank()) {
@@ -586,68 +684,115 @@ fun DubberLiveApp() {
                     videoUrl = ""
                 }
             },
-            modifier = Modifier.fillMaxWidth().height(48.dp),
-            enabled = videoUrl.isNotBlank() && cloudServerKey.isNotBlank()
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp),
+            enabled = videoUrl.isNotBlank() && cloudServerKey.isNotBlank(),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = PrimaryIndigo)
         ) {
-            Text("➕ Add to Processing Queue", fontSize = 15.sp)
+            Text("➕ Add to Dubbing Queue", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
         }
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Live Upload Tracking to Meta
+        // Live Facebook Upload Card
         if (isUploadingToFb) {
             Card(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF))
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    Text(fbUploadStage, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(fbUploadStage, fontWeight = FontWeight.Bold, fontSize = 12.sp, color = PrimaryIndigo)
+                        Text("$fbUploadPercent%", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = PrimaryIndigo)
+                    }
                     Spacer(modifier = Modifier.height(6.dp))
                     LinearProgressIndicator(
                         progress = fbUploadPercent / 100f,
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                        color = PrimaryIndigo,
+                        trackColor = Color(0xFFDBEAFE)
                     )
                 }
             }
         }
 
-        // Live Status Card + Reconnect Button
+        // Live Engine Status Card + Connectivity Error Box
         Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(8.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(
+                    width = 1.dp,
+                    color = if (DubberQueueManager.hasCloudError) CoralError.copy(alpha = 0.4f) else Color(0xFFE2E8F0),
+                    shape = RoundedCornerShape(14.dp)
+                ),
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = if (DubberQueueManager.hasCloudError) Color(0xFFFEF2F2) else CardBackground
+            )
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Text(DubberQueueManager.currentStatus, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            Column(modifier = Modifier.padding(14.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = DubberQueueManager.currentStatus,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = if (DubberQueueManager.hasCloudError) CoralError else Color(0xFF0F172A)
+                    )
+
+                    if (DubberQueueManager.isProcessing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = PrimaryIndigo
+                        )
+                    }
+                }
+
                 if (DubberQueueManager.firstLinePreview.isNotBlank()) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         "🗣️ 1st Line: \"${DubberQueueManager.firstLinePreview}\"",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color(0xFF00796B)
+                        color = Color(0xFF0D9488)
                     )
                 }
+
                 if (DubberQueueManager.detailedLogs.isNotBlank()) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         DubberQueueManager.detailedLogs,
                         fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                        color = TextMuted,
+                        fontFamily = FontFamily.Monospace
                     )
                 }
 
-                // Dedicated Reconnect Action Button when mobile network drops
+                // Cloud Connectivity Error Retry Action
                 if (DubberQueueManager.canReconnect && DubberQueueManager.activeRunId != null) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Button(
                         onClick = { DubberQueueManager.reconnect(context) },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00796B)),
-                        modifier = Modifier.fillMaxWidth().height(40.dp)
+                        colors = ButtonDefaults.buttonColors(containerColor = CoralError),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(40.dp)
                     ) {
                         Text(
-                            "🔄 Reconnect to Task #${DubberQueueManager.activeRunId}",
+                            "🔄 Retry",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color.White
@@ -657,33 +802,42 @@ fun DubberLiveApp() {
             }
         }
 
+        // History Video Cards
         if (DubberQueueManager.historyList.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(16.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("🕒 Generated Videos (${DubberQueueManager.historyList.size})", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                Text(
+                    "🕒 Dubbed Videos (${DubberQueueManager.historyList.size})",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    color = Color(0xFF0F172A)
+                )
                 TextButton(
                     onClick = { DubberQueueManager.clearAll(context) },
-                    colors = ButtonDefaults.textButtonColors(contentColor = Color.Red)
+                    colors = ButtonDefaults.textButtonColors(contentColor = CoralError)
                 ) {
-                    Text("🗑️ Clear All", fontSize = 12.sp)
+                    Text("🗑️ Clear List", fontSize = 12.sp)
                 }
             }
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(4.dp))
 
             Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 DubberQueueManager.historyList.forEach { history ->
                     var cardScheduleMinutes by remember { mutableStateOf("0") }
 
                     Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(14.dp)),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = CardDefaults.cardColors(containerColor = CardBackground)
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            // Header: Clean Title + Info + Delete
+                            // Video Title Header
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -696,13 +850,14 @@ fun DubberLiveApp() {
                                         fontSize = 13.sp,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
+                                        color = Color(0xFF0F172A),
                                         modifier = Modifier.clickable {
                                             customTitle = history.title
                                             prefs.edit().putString("custom_title", history.title).apply()
                                             Toast.makeText(context, "Populated title in Custom Box!", Toast.LENGTH_SHORT).show()
                                         }
                                     )
-                                    Text(history.timestamp, fontSize = 10.sp, color = Color.Gray)
+                                    Text(history.timestamp, fontSize = 10.sp, color = TextMuted)
                                 }
 
                                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -711,7 +866,7 @@ fun DubberLiveApp() {
                                             onClick = { activeMetadataDialog = history.sourceMetaText },
                                             modifier = Modifier.size(28.dp)
                                         ) {
-                                            Text("ℹ️", fontSize = 14.sp)
+                                            Text("ℹ️", fontSize = 13.sp)
                                         }
                                     }
 
@@ -721,7 +876,7 @@ fun DubberLiveApp() {
                                         onClick = { DubberQueueManager.removeItem(context, history) },
                                         modifier = Modifier.size(28.dp)
                                     ) {
-                                        Text("✕", fontWeight = FontWeight.Bold, color = Color.Gray, fontSize = 14.sp)
+                                        Text("✕", fontWeight = FontWeight.Bold, color = TextMuted, fontSize = 13.sp)
                                     }
                                 }
                             }
@@ -734,7 +889,8 @@ fun DubberLiveApp() {
                                 OutlinedButton(
                                     onClick = { dropdownExpanded = true },
                                     modifier = Modifier.fillMaxWidth().height(36.dp),
-                                    contentPadding = PaddingValues(horizontal = 8.dp)
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp)
                                 ) {
                                     Text(
                                         "Target: ${selectedPageAccount?.name ?: "Select Target Page"} ▼",
@@ -761,31 +917,32 @@ fun DubberLiveApp() {
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            // Schedule Input Box
+                            // Schedule Input Row
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                Text("🕒 Schedule (Mins):", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                Text("🕒 Schedule:", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = TextMuted)
                                 OutlinedTextField(
                                     value = cardScheduleMinutes,
                                     onValueChange = { cardScheduleMinutes = it.filter { ch -> ch.isDigit() } },
-                                    placeholder = { Text("0 = Now", fontSize = 10.sp) },
-                                    modifier = Modifier.width(90.dp).height(44.dp),
+                                    placeholder = { Text("0=Now", fontSize = 10.sp) },
+                                    modifier = Modifier.width(90.dp).height(42.dp),
+                                    shape = RoundedCornerShape(8.dp),
                                     textStyle = androidx.compose.ui.text.TextStyle(fontSize = 11.sp),
                                     singleLine = true
                                 )
                                 Text(
                                     text = if ((cardScheduleMinutes.toLongOrNull() ?: 0L) >= 20L) "Will schedule" else "Immediate",
                                     fontSize = 10.sp,
-                                    color = if ((cardScheduleMinutes.toLongOrNull() ?: 0L) >= 20L) Color(0xFF1565C0) else Color.Gray
+                                    color = if ((cardScheduleMinutes.toLongOrNull() ?: 0L) >= 20L) PrimaryIndigo else TextMuted
                                 )
                             }
 
-                            Spacer(modifier = Modifier.height(8.dp))
+                            Spacer(modifier = Modifier.height(10.dp))
 
-                            // Action Buttons: Watch | Copy | Open | Upload / Schedule
+                            // Action Buttons Row
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -805,10 +962,10 @@ fun DubberLiveApp() {
                                     },
                                     modifier = Modifier.size(38.dp),
                                     shape = CircleShape,
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32)),
+                                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldSuccess),
                                     contentPadding = PaddingValues(0.dp)
                                 ) {
-                                    Text("▶", fontSize = 14.sp, color = Color.White)
+                                    Text("▶", fontSize = 13.sp, color = Color.White)
                                 }
 
                                 OutlinedButton(
@@ -821,7 +978,7 @@ fun DubberLiveApp() {
                                     shape = CircleShape,
                                     contentPadding = PaddingValues(0.dp)
                                 ) {
-                                    Text("📋", fontSize = 13.sp)
+                                    Text("📋", fontSize = 12.sp)
                                 }
 
                                 OutlinedButton(
@@ -833,7 +990,7 @@ fun DubberLiveApp() {
                                     shape = CircleShape,
                                     contentPadding = PaddingValues(0.dp)
                                 ) {
-                                    Text("↗", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                    Text("↗", fontSize = 13.sp, fontWeight = FontWeight.Bold)
                                 }
 
                                 val schedMins = cardScheduleMinutes.toLongOrNull() ?: 0L
@@ -873,7 +1030,7 @@ fun DubberLiveApp() {
                                                         history.isUploaded = true
                                                         DubberQueueManager.saveHistory(context)
 
-                                                        // AUTO EMPTY TITLE BOX AFTER SUCCESSFUL UPLOAD
+                                                        // Auto clear title upon successful upload
                                                         customTitle = ""
                                                         prefs.edit().putString("custom_title", "").apply()
 
@@ -889,10 +1046,11 @@ fun DubberLiveApp() {
                                         }
                                     },
                                     modifier = Modifier.weight(1f).height(38.dp),
+                                    shape = RoundedCornerShape(10.dp),
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = when {
-                                            isScheduledMode -> Color(0xFF1565C0)
-                                            history.isUploaded -> Color(0xFFE65100)
+                                            isScheduledMode -> PrimaryIndigo
+                                            history.isUploaded -> AmberWarning
                                             else -> Color(0xFF1877F2)
                                         }
                                     ),
@@ -903,20 +1061,11 @@ fun DubberLiveApp() {
                                         history.isUploaded -> "🔄 Re-upload"
                                         else -> "🚀 Upload FB"
                                     }
-                                    Text(btnLabel, fontSize = 11.sp, color = Color.White)
+                                    Text(btnLabel, fontSize = 11.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
                                 }
                             }
                         }
                     }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-                OutlinedButton(
-                    onClick = { DubberQueueManager.clearAll(context) },
-                    modifier = Modifier.fillMaxWidth().height(44.dp),
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Red)
-                ) {
-                    Text("🗑️ Clear All Videos from List", fontSize = 13.sp)
                 }
             }
         }
@@ -1089,20 +1238,19 @@ suspend fun monitorCloudRun(
             } else {
                 consecutiveNetworkErrors++
                 if (consecutiveNetworkErrors > 6) {
-                    withContext(Dispatchers.Main) { onError("Server returned HTTP ${jobRes.code}") }
+                    withContext(Dispatchers.Main) { onError("Cloud Connectivity Error.") }
                     return@withContext
                 }
             }
         } catch (e: Exception) {
             consecutiveNetworkErrors++
             if (consecutiveNetworkErrors <= 6) {
-                // Auto-retry mobile connection drop silently before giving up
                 onStatusUpdate("📡 Signal weak. Reconnecting ($consecutiveNetworkErrors/6)...", "Network timeout, retrying...", "")
                 delay(3000)
                 continue
             } else {
                 withContext(Dispatchers.Main) {
-                    onError("Network connection lost: ${e.localizedMessage}")
+                    onError("Cloud Connectivity Error.")
                 }
                 return@withContext
             }
