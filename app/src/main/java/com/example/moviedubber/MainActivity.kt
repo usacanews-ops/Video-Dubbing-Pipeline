@@ -225,7 +225,7 @@ object DubberQueueManager {
                 onError = { err ->
                     isProcessing = false
                     lastFailedItem = nextItem
-                    currentStatus = "❌ Connection failed: $err"
+                    currentStatus = "❌ Pipeline error: $err"
                     processNext(context)
                 }
             )
@@ -848,8 +848,35 @@ suspend fun executeCloudDubbingPipeline(
         .build()
 
     try {
+        onStatusUpdate("Checking existing workflows...", "", "")
+
+        // 0. Cache existing run IDs to ensure we pick up the newly generated one
+        val runsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs?per_page=5"
+        val existingRunIds = mutableSetOf<Long>()
+
+        try {
+            val listBeforeReq = Request.Builder()
+                .url(runsUrl)
+                .addHeader("Authorization", "Bearer $token")
+                .addHeader("Accept", "application/vnd.github.v3+json")
+                .build()
+
+            executeWithRetry(context, client, listBeforeReq, maxRetries = 2).use { res ->
+                if (res.isSuccessful) {
+                    val bodyStr = res.body?.string() ?: "{}"
+                    val runs = JSONObject(bodyStr).optJSONArray("workflow_runs")
+                    if (runs != null) {
+                        for (i in 0 until runs.length()) {
+                            existingRunIds.add(runs.getJSONObject(i).optLong("id"))
+                        }
+                    }
+                }
+            }
+        } catch (ignored: Exception) {}
+
         onStatusUpdate("Triggering remote cloud worker...", "", "")
 
+        // 1. Dispatch Repository Workflow
         val dispatchUrl = "https://api.github.com/repos/$owner/$repo/dispatches"
         val payload = JSONObject().apply {
             put("event_type", "run_dubber")
@@ -871,17 +898,19 @@ suspend fun executeCloudDubbingPipeline(
             onStatusUpdate(retryMsg, "", "")
         }.use { res ->
             if (!res.isSuccessful && res.code != 204) {
-                onError("Failed to trigger pipeline (${res.code}): ${res.body?.string()}")
+                val errorDetails = res.body?.string() ?: res.message
+                onError("Failed to trigger pipeline (${res.code}): $errorDetails")
                 return@withContext
             }
         }
 
-        delay(8000)
-
+        // 2. Poll for the newly started workflow run ID (up to 25 attempts / ~75 seconds)
         var runId: Long? = null
-        val runsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs?event=repository_dispatch&per_page=1"
 
-        for (attempt in 0..12) {
+        for (attempt in 1..25) {
+            delay(3000)
+            onStatusUpdate("Registering remote worker ($attempt/25)...", "", "")
+
             val listReq = Request.Builder()
                 .url(runsUrl)
                 .addHeader("Authorization", "Bearer $token")
@@ -894,21 +923,30 @@ suspend fun executeCloudDubbingPipeline(
                         val bodyStr = res.body?.string() ?: "{}"
                         val runs = JSONObject(bodyStr).optJSONArray("workflow_runs")
                         if (runs != null && runs.length() > 0) {
-                            runId = runs.getJSONObject(0).optLong("id")
+                            for (i in 0 until runs.length()) {
+                                val currentId = runs.getJSONObject(i).optLong("id")
+                                if (!existingRunIds.contains(currentId)) {
+                                    runId = currentId
+                                    break
+                                }
+                            }
+                            if (runId == null && existingRunIds.isEmpty()) {
+                                runId = runs.getJSONObject(0).optLong("id")
+                            }
                         }
                     }
                 }
             } catch (ignored: Exception) {}
 
             if (runId != null) break
-            delay(3000)
         }
 
         if (runId == null) {
-            onError("Workflow run could not be registered.")
+            onError("Workflow run could not be registered. Ensure your workflow YAML contains 'repository_dispatch: types: [run_dubber]' on the default branch.")
             return@withContext
         }
 
+        // 3. Poll Workflow Run Status
         val checkUrl = "https://api.github.com/repos/$owner/$repo/actions/runs/$runId"
         var isFinished = false
         var currentTitle = "Dubbed Video"
@@ -947,6 +985,7 @@ suspend fun executeCloudDubbingPipeline(
             }
         }
 
+        // 4. Retrieve Published Output Artifacts
         val artifactsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs/$runId/artifacts"
         var downloadUrl = ""
 
