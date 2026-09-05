@@ -208,6 +208,7 @@ object DubberQueueManager {
                 videoUrl = nextItem.videoUrl.trim(),
                 targetLang = nextItem.targetLang,
                 speed = nextItem.speed,
+                currentItemId = nextItem.id,
                 onStatusUpdate = { status, log, preview ->
                     currentStatus = status
                     detailedLogs = log
@@ -599,7 +600,7 @@ fun DubberLiveApp() {
                         modifier = Modifier.fillMaxWidth().height(36.dp),
                         contentPadding = PaddingValues(horizontal = 8.dp)
                     ) {
-                        Text("🔄 Retry Connection Now", fontSize = 12.sp, color = Color.White)
+                        Text("🔄 Retry Trigger", fontSize = 12.sp, color = Color.White)
                     }
                 }
 
@@ -746,10 +747,10 @@ fun DubberLiveApp() {
                                                 isUploadingToFb = false
                                                 item.isUploaded = true
                                                 DubberQueueManager.saveHistory(context)
-                                                
+
                                                 customTitle = ""
                                                 prefs.edit().putString("custom_title", "").apply()
-                                                
+
                                                 Toast.makeText(context, "✅ Published to ${page.name}!", Toast.LENGTH_LONG).show()
                                             },
                                             onError = { err ->
@@ -828,7 +829,7 @@ suspend fun executeWithRetry(
 }
 
 // -------------------------------------------------------------------------------------
-// Cloud Dubbing Pipeline Execution (GitHub Actions / Cloud Dispatcher)
+// Cloud Dubbing Pipeline Execution (Targets Specific Current Job ID)
 // -------------------------------------------------------------------------------------
 suspend fun executeCloudDubbingPipeline(
     context: Context,
@@ -838,6 +839,7 @@ suspend fun executeCloudDubbingPipeline(
     videoUrl: String,
     targetLang: String,
     speed: Float,
+    currentItemId: Long,
     onStatusUpdate: (status: String, log: String, preview: String) -> Unit,
     onComplete: (downloadUrl: String, title: String) -> Unit,
     onError: (error: String) -> Unit
@@ -848,39 +850,15 @@ suspend fun executeCloudDubbingPipeline(
         .build()
 
     try {
-        onStatusUpdate("Checking existing workflows...", "", "")
+        val uniqueJobTag = "job_$currentItemId"
+        onStatusUpdate("Triggering remote worker ($uniqueJobTag)...", "", "")
 
-        // 0. Cache existing run IDs to ensure we pick up the newly generated one
-        val runsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs?per_page=5"
-        val existingRunIds = mutableSetOf<Long>()
-
-        try {
-            val listBeforeReq = Request.Builder()
-                .url(runsUrl)
-                .addHeader("Authorization", "Bearer $token")
-                .addHeader("Accept", "application/vnd.github.v3+json")
-                .build()
-
-            executeWithRetry(context, client, listBeforeReq, maxRetries = 2).use { res ->
-                if (res.isSuccessful) {
-                    val bodyStr = res.body?.string() ?: "{}"
-                    val runs = JSONObject(bodyStr).optJSONArray("workflow_runs")
-                    if (runs != null) {
-                        for (i in 0 until runs.length()) {
-                            existingRunIds.add(runs.getJSONObject(i).optLong("id"))
-                        }
-                    }
-                }
-            }
-        } catch (ignored: Exception) {}
-
-        onStatusUpdate("Triggering remote cloud worker...", "", "")
-
-        // 1. Dispatch Repository Workflow
+        // 1. Dispatch Repository Workflow carrying the unique ID
         val dispatchUrl = "https://api.github.com/repos/$owner/$repo/dispatches"
         val payload = JSONObject().apply {
             put("event_type", "run_dubber")
             put("client_payload", JSONObject().apply {
+                put("job_id", uniqueJobTag)
                 put("video_url", videoUrl)
                 put("target_lang", targetLang)
                 put("speed", speed.toString())
@@ -904,34 +882,35 @@ suspend fun executeCloudDubbingPipeline(
             }
         }
 
-        // 2. Poll for the newly started workflow run ID (up to 25 attempts / ~75 seconds)
+        // 2. Poll only the current run ID matching the job dispatch time
         var runId: Long? = null
+        val runsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs?event=repository_dispatch&per_page=1"
 
         for (attempt in 1..25) {
             delay(3000)
-            onStatusUpdate("Registering remote worker ($attempt/25)...", "", "")
+            onStatusUpdate("Locating worker instance ($attempt/25)...", "", "")
 
-            val listReq = Request.Builder()
+            val pollReq = Request.Builder()
                 .url(runsUrl)
                 .addHeader("Authorization", "Bearer $token")
                 .addHeader("Accept", "application/vnd.github.v3+json")
                 .build()
 
             try {
-                executeWithRetry(context, client, listReq, maxRetries = 3).use { res ->
+                executeWithRetry(context, client, pollReq, maxRetries = 2).use { res ->
                     if (res.isSuccessful) {
                         val bodyStr = res.body?.string() ?: "{}"
                         val runs = JSONObject(bodyStr).optJSONArray("workflow_runs")
                         if (runs != null && runs.length() > 0) {
-                            for (i in 0 until runs.length()) {
-                                val currentId = runs.getJSONObject(i).optLong("id")
-                                if (!existingRunIds.contains(currentId)) {
-                                    runId = currentId
-                                    break
-                                }
-                            }
-                            if (runId == null && existingRunIds.isEmpty()) {
-                                runId = runs.getJSONObject(0).optLong("id")
+                            val candidate = runs.getJSONObject(0)
+                            val createdAtStr = candidate.optString("created_at")
+                            val createdEpoch = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+                                timeZone = TimeZone.getTimeZone("UTC")
+                            }.parse(createdAtStr)?.time ?: 0L
+
+                            // Only register if created within 2 minutes of the current dispatch
+                            if (createdEpoch >= currentItemId - 120000L) {
+                                runId = candidate.optLong("id")
                             }
                         }
                     }
@@ -942,11 +921,11 @@ suspend fun executeCloudDubbingPipeline(
         }
 
         if (runId == null) {
-            onError("Workflow run could not be registered. Ensure your workflow YAML contains 'repository_dispatch: types: [run_dubber]' on the default branch.")
+            onError("Workflow run could not be registered for Job ID $uniqueJobTag. Ensure your YAML trigger is active.")
             return@withContext
         }
 
-        // 3. Poll Workflow Run Status
+        // 3. Monitor execution of this specific run ID only
         val checkUrl = "https://api.github.com/repos/$owner/$repo/actions/runs/$runId"
         var isFinished = false
         var currentTitle = "Dubbed Video"
@@ -985,36 +964,46 @@ suspend fun executeCloudDubbingPipeline(
             }
         }
 
-        // 4. Retrieve Published Output Artifacts
-        val artifactsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs/$runId/artifacts"
-        var downloadUrl = ""
+        // 4. Retrieve Release/Artifact download URL
+        var downloadUrl = "https://github.com/$owner/$repo/actions/runs/$runId"
+        val releaseUrl = "https://api.github.com/repos/$owner/$repo/releases"
 
-        val artReq = Request.Builder()
-            .url(artifactsUrl)
-            .addHeader("Authorization", "Bearer $token")
-            .addHeader("Accept", "application/vnd.github.v3+json")
-            .build()
+        try {
+            val relReq = Request.Builder()
+                .url(releaseUrl)
+                .addHeader("Authorization", "Bearer $token")
+                .addHeader("Accept", "application/vnd.github.v3+json")
+                .build()
 
-        executeWithRetry(context, client, artReq).use { res ->
-            if (res.isSuccessful) {
-                val artObj = JSONObject(res.body?.string() ?: "{}")
-                val arts = artObj.optJSONArray("artifacts")
-                if (arts != null && arts.length() > 0) {
-                    for (i in 0 until arts.length()) {
-                        val item = arts.getJSONObject(i)
-                        if (item.optString("name").contains("video", ignoreCase = true)) {
-                            downloadUrl = item.optString("archive_download_url")
+            executeWithRetry(context, client, relReq).use { res ->
+                if (res.isSuccessful) {
+                    val releases = JSONArray(res.body?.string() ?: "[]")
+                    for (i in 0 until releases.length()) {
+                        val rel = releases.getJSONObject(i)
+                        val tagName = rel.optString("tag_name")
+                        if (tagName.contains(runId.toString())) {
+                            val assets = rel.optJSONArray("assets")
+                            if (assets != null) {
+                                for (j in 0 until assets.length()) {
+                                    val asset = assets.getJSONObject(j)
+                                    if (asset.optString("name").endsWith(".mp4", ignoreCase = true)) {
+                                        downloadUrl = asset.optString("browser_download_url")
+                                        break
+                                    }
+                                }
+                            }
+                            break
                         }
                     }
                 }
             }
-        }
+        } catch (ignored: Exception) {}
 
         val timestamp = SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date())
         val historyItem = HistoryItem(
-            id = UUID.randomUUID().toString(),
+            id = uniqueJobTag,
             title = currentTitle,
-            downloadUrl = downloadUrl.ifBlank { "https://github.com/$owner/$repo/actions/runs/$runId" },
+            downloadUrl = downloadUrl,
             srtUrl = "",
             timestamp = timestamp,
             sourceMetaText = sourceMetaText
