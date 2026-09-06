@@ -1,3 +1,5 @@
+#Ok working. 06 Sep 26
+
 import os, sys, re, json, time, math, shutil, asyncio, subprocess, urllib.request, urllib.error
 import yt_dlp, edge_tts
 from faster_whisper import WhisperModel
