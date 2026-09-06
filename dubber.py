@@ -1,409 +1,609 @@
-#Ok working. 06 Sep 26
-
-import os, sys, re, json, time, math, shutil, asyncio, subprocess, urllib.request, urllib.error
-import yt_dlp, edge_tts
+import os
+import sys
+import subprocess
+import asyncio
+import time
+import re
+import json
+import shutil
+import yt_dlp
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator, MyMemoryTranslator
+import edge_tts
 from pydub import AudioSegment
 
-FINAL_SPEED = 1.10
-MAX_SENTENCE_SPEED = 1.12
-TTS_RATE = "+5%"
+# ================= CONFIG =================
+
+# 1. Pacing & Speed
+TTS_RATE = "+15%"          # Fast, natural delivery
+FINAL_SPEED = 1.10         # Exact +10% uniform master speedup
+
+# 2. Timing Controls
+ENABLE_FREEZE = True
+SAFETY_GAP = 0.03
+SILENCE_THRESHOLD = -42
 WHISPER_MODEL = "tiny"
-VIDEO_CRF = "27"
-VIDEO_PRESET = "veryfast"
+
+# 3. Quality & Bitrate Controls (Crisp 1080p/720p with compact 12-16 MB size)
+FINAL_CRF = "22"           # Studio-grade visual quality
+MAX_VIDEO_BITRATE = "2200k"# Bitrate ceiling to prevent file bloat
+BUFFER_SIZE = "4400k"
 AUDIO_BITRATE = "128k"
-TEMP_DIR = "temp_audio"
-OUTPUT_VIDEO = "final_output.mp4"
-OUTPUT_SRT = "subtitles.srt"
-FREEZE_ENABLED = True
-NATURALIZE_HINDI = True
-GEMINI_MODEL = "gemini-2.5-flash"
-TTS_RETRIES = 3
 
 VOICE_MAP = {
-    "hi": "hi-IN-MadhurNeural", "bn": "bn-IN-BashkarNeural", "ta": "ta-IN-ValluvarNeural",
-    "te": "te-IN-MohanNeural", "mr": "mr-IN-ManoharNeural", "gu": "gu-IN-DhwaniNeural",
-    "kn": "kn-IN-GaganNeural", "ml": "ml-IN-MidhunNeural", "pa": "pa-IN-OjasNeural",
-    "en": "en-US-GuyNeural", "fr": "fr-FR-HenriNeural", "de": "de-DE-ConradNeural",
-    "es": "es-ES-AlvaroNeural", "it": "it-IT-DiegoNeural", "pt": "pt-BR-AntonioNeural",
-    "nl": "nl-NL-MaartenNeural", "pl": "pl-PL-MarekNeural", "tr": "tr-TR-AhmetNeural",
-    "ru": "ru-RU-DmitryNeural", "uk": "uk-UA-OstapNeural", "ja": "ja-JP-KeitaNeural",
-    "ko": "ko-KR-InJoonNeural", "zh": "zh-CN-YunxiNeural", "ar": "ar-SA-HamedNeural"
+    "hi": "hi-IN-MadhurNeural",
+    "bn": "bn-IN-BashkarNeural",
+    "ta": "ta-IN-ValluvarNeural",
+    "te": "te-IN-MohanNeural",
+    "mr": "mr-IN-ManoharNeural",
+    "gu": "gu-IN-DhwaniNeural",
+    "kn": "kn-IN-GaganNeural",
+    "ml": "ml-IN-MidhunNeural",
+    "pa": "pa-IN-OjasNeural",
+    "en": "en-US-GuyNeural",
+    "fr": "fr-FR-HenriNeural",
+    "de": "de-DE-ConradNeural",
+    "es": "es-ES-AlvaroNeural",
+    "it": "it-IT-DiegoNeural",
+    "pt": "pt-BR-AntonioNeural",
+    "nl": "nl-NL-MaartenNeural",
+    "pl": "pl-PL-MarekNeural",
+    "tr": "tr-TR-AhmetNeural",
+    "ru": "ru-RU-DmitryNeural",
+    "uk": "uk-UA-OstapNeural",
+    "ja": "ja-JP-KeitaNeural",
+    "ko": "ko-KR-InJoonNeural",
+    "zh": "zh-CN-YunxiNeural",
+    "ar": "ar-SA-HamedNeural"
 }
 
-def run(cmd, quiet=False):
-    print("▶ " + " ".join(f'"{x}"' if " " in str(x) else str(x) for x in cmd))
-    subprocess.run(cmd, stdout=subprocess.DEVNULL if quiet else None, stderr=subprocess.DEVNULL if quiet else None, check=True)
+# ================= UTILITIES =================
+
+def run_command(cmd, quiet=False):
+    return subprocess.run(
+        cmd,
+        stdout=subprocess.DEVNULL if quiet else None,
+        stderr=subprocess.DEVNULL if quiet else None,
+        check=True
+    )
 
 def get_duration(path):
-    res = subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path], stderr=subprocess.STDOUT)
-    return float(res.strip())
+    result = subprocess.check_output([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path
+    ])
+    return float(result.strip())
 
-def size_mb(path):
-    return os.path.getsize(path) / 1048576.0 if os.path.exists(path) else 0.0
-
-def clean_text(text):
-    return re.sub(r"\s+", " ", str(text or "")).strip()
-
-def contains_hindi(text):
-    return bool(text and re.search(r"[\u0900-\u097F]", text))
-
-def invalid_translation(text):
-    if not text: return True
-    v = text.lower()
-    bads = ("<html", "<!doctype", "captcha", "access denied", "server error", "unusual traffic", "invalid language", "languages are supported", "is an invalid language", "traceback", "exception")
-    return any(b in v for b in bads)
-
-def clean_social_title(title):
-    t = clean_text(title)
-    # Strip patterns like '83K views · 876 reactions | '
-    t = re.sub(r"^[\d.,KMkm]+\s*views\s*·\s*[\d.,KMkm]+\s*reactions\s*\|\s*", "", t, flags=re.IGNORECASE)
-    # Strip alternate separators or partial badges if present
-    t = re.sub(r"^[\d.,KMkm]+\s*views\s*\|\s*", "", t, flags=re.IGNORECASE)
-    return t.strip()
+# ================= DOWNLOAD =================
 
 def download_media(url):
-    video_path, audio_path = "raw_source.mp4", "input_audio.wav"
-    for p in (video_path, audio_path):
-        if os.path.exists(p):
-            try: os.remove(p)
-            except Exception: pass
+    video_path = "raw_source.mp4"
+    audio_path = "input_audio.wav"
+
+    for path in (video_path, audio_path):
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    opts = {
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "outtmpl": video_path,
+        "merge_output_format": "mp4",
+        "quiet": True,
+        "no_warnings": True
+    }
+
     print("📥 Downloading media...")
-    opts = {"format": "best[ext=mp4]/best", "outtmpl": video_path, "merge_output_format": "mp4", "noplaylist": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-    raw_title = info.get("title", "Dubbed Video")
-    cleaned_title = clean_social_title(raw_title)
-    meta = {"title": cleaned_title, "description": info.get("description", ""), "tags": info.get("tags", [])}
+        meta = ydl.extract_info(url, download=True)
+        metadata = {
+            "title": meta.get("title", "Dubbed Video"),
+            "description": meta.get("description", ""),
+            "tags": meta.get("tags", [])
+        }
+
     with open("source_meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    print("TITLE_EMIT: " + meta["title"])
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    print(f"TITLE_EMIT: {metadata['title']}")
     print("🎵 Extracting source audio...")
-    run(["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", audio_path], quiet=True)
-    return video_path, audio_path, meta
 
-def naturalize_with_gemini(text, target_lang="hi"):
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key: return None
-    lang_names = {"hi": "natural spoken Hindi (Devanagari script only)", "pa": "natural spoken Punjabi (Gurmukhi script only)", "bn": "natural spoken Bengali", "ta": "natural spoken Tamil", "te": "natural spoken Telugu", "mr": "natural spoken Marathi", "en": "conversational English"}
-    target_desc = lang_names.get(target_lang, target_lang)
-    prompt = f"Translate and adapt into {target_desc} for video dubbing.\nRules:\n- Simple everyday spoken phrasing.\n- Retain brand names, technical terms, and numbers as commonly spoken.\n- Return ONLY the translated sentence. No English notes or quotes.\n\nSentence: {text}"
-    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": 350}}
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json", "x-goog-api-key": api_key}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as res:
-            data = json.loads(res.read().decode("utf-8"))
-        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        if parts:
-            result = parts[0].get("text", "").strip()
-            result = re.sub(r"^```(?:text|hindi)?\s*", "", result, flags=re.I)
-            result = re.sub(r"\s*```$", "", result).strip()
-            result = clean_text(re.sub(r"^[\"']|[\"']$", "", result))
-            if target_lang == "hi" and not contains_hindi(result): return None
-            return result
-    except Exception as e:
-        print(f"⚠️ Gemini translation error: {e}")
-    return None
+    run_command([
+        "ffmpeg", "-y", "-err_detect", "ignore_err",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        audio_path
+    ], quiet=True)
 
-def translate_text(text, target, source_lang="en"):
-    text = clean_text(text)
-    if len(text) < 2: return text
-    gem_res = naturalize_with_gemini(text, target)
-    if gem_res and not invalid_translation(gem_res): return gem_res
+    return video_path, audio_path, metadata
 
-    src, tgt = (source_lang or "en").lower(), (target or "hi").lower()
+# ================= TRANSLATION =================
+
+def contains_devanagari(text):
+    return bool(re.search(r"[\u0900-\u097F]", text))
+
+def is_error_page(text):
+    t = text.lower()
+    return any(x in t for x in (
+        "server error", "500", "!!1500", "<!doctype", "<html", "captcha", "unusual traffic"
+    ))
+
+def translate_text(text, target_lang):
+    text = re.sub(r"[\r\n\t]+", " ", text).strip()
+    if not text or len(text) < 2:
+        return text
+
+    if target_lang == "hi":
+        for _ in range(3):
+            try:
+                result = GoogleTranslator(source="auto", target="hi").translate(text)
+                if result and not is_error_page(result) and contains_devanagari(result):
+                    return result.strip()
+            except Exception:
+                time.sleep(0.2)
+
+        try:
+            result = MyMemoryTranslator(source="auto", target="hi-IN").translate(text)
+            if result and not is_error_page(result) and contains_devanagari(result):
+                return result.strip()
+        except Exception:
+            pass
+        return ""
+
     for _ in range(3):
         try:
-            res = GoogleTranslator(source=src, target=tgt).translate(text)
-            if res and not invalid_translation(res):
-                cl = clean_text(res)
-                if tgt != "hi" or contains_hindi(cl): return cl
+            result = GoogleTranslator(source="auto", target=target_lang).translate(text)
+            if result and not is_error_page(result):
+                return result.strip()
         except Exception:
-            time.sleep(0.4)
+            time.sleep(0.2)
 
-    mm_codes = {"hi": "hindi", "en": "english", "bn": "bengali", "ta": "tamil", "te": "telugu", "mr": "marathi", "gu": "gujarati", "kn": "kannada", "ml": "malayalam", "pa": "punjabi", "fr": "french", "de": "german", "es": "spanish", "it": "italian", "pt": "portuguese", "nl": "dutch", "pl": "polish", "tr": "turkish", "ru": "russian", "uk": "ukrainian", "ja": "japanese", "ko": "korean", "zh": "chinese", "ar": "arabic"}
-    try:
-        res = MyMemoryTranslator(source=mm_codes.get(src, "english"), target=mm_codes.get(tgt, "hindi")).translate(text)
-        if res and not invalid_translation(res):
-            cl = clean_text(res)
-            if tgt != "hi" or contains_hindi(cl): return cl
-    except Exception: pass
-    print("⚠️ Translation fallback: using original text.")
     return text
 
-def transcribe(audio_path, target_lang):
+# ================= WHISPER =================
+
+def transcribe_and_translate(audio_path, target_lang):
     print("🧠 Loading Whisper...")
     model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-    print("🎙️ Transcribing...")
-    result, info = model.transcribe(audio_path, language=None, vad_filter=True, vad_parameters={"min_silence_duration_ms": 300})
-    detected_lang = info.language or "en"
-    print(f"🌍 Detected language: {detected_lang}")
+
+    print("🎙️ Transcribing source audio...")
+    raw_segments, info = model.transcribe(
+        audio_path,
+        language=None,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 350}
+    )
+    print(f"🌍 Detected source language: {info.language}")
 
     raw = []
-    for item in result:
-        txt = clean_text(item.text)
-        st, ed = float(item.start), float(item.end)
-        if not txt or ed <= st or (ed - st < 0.20): continue
-        raw.append({"start": st, "end": ed, "text": txt})
-    if not raw: return []
-
-    blocks, cur_txt, cur_st, cur_ed = [], [], raw[0]["start"], raw[0]["end"]
-    for i, item in enumerate(raw):
-        cur_txt.append(item["text"])
-        cur_ed = item["end"]
-        punct = item["text"].rstrip().endswith((".", "!", "?", "।", "…"))
-        gap = (raw[i + 1]["start"] - item["end"]) if (i + 1 < len(raw)) else 0
-        if punct or gap >= 0.70 or (cur_ed - cur_st >= 8.0) or (i == len(raw) - 1):
-            t = clean_text(" ".join(cur_txt))
-            if t: blocks.append({"start": cur_st, "end": cur_ed, "text": t})
-            cur_txt = []
-            if i + 1 < len(raw): cur_st = raw[i + 1]["start"]
-
-    print(f"📝 Dialogue blocks: {len(blocks)}")
-    segments = []
-    for i, b in enumerate(blocks):
-        slot = max(0.30, (blocks[i + 1]["start"] - b["start"]) if (i + 1 < len(blocks)) else (b["end"] - b["start"]))
-        print(f"Translating block {i + 1}/{len(blocks)}...")
-        translated = translate_text(b["text"], target_lang, source_lang=detected_lang)
-        segments.append({
-            "index": i, "source_start": b["start"], "source_end": b["end"], "slot": slot,
-            "source_text": b["text"], "translated_text": translated, "target_lang": target_lang
+    for segment in raw_segments:
+        text = segment.text.strip()
+        if not text or (segment.end - segment.start < 0.15):
+            continue
+        raw.append({
+            "start": float(segment.start),
+            "end": float(segment.end),
+            "text": text
         })
+
+    if not raw:
+        return []
+
+    print(f"📝 Whisper found {len(raw)} speech segments.")
+    segments = []
+
+    for i, source in enumerate(raw):
+        start = source["start"]
+        if i + 1 < len(raw):
+            source_slot = raw[i + 1]["start"] - start - SAFETY_GAP
+        else:
+            source_slot = source["end"] - start + 2.0
+
+        source_slot = max(0.25, source_slot)
+        translated = translate_text(source["text"], target_lang)
+
+        if not translated and target_lang != "hi":
+            translated = source["text"]
+
+        if i == 0:
+            print("TRANSLATION_PREVIEW: " + translated[:120])
+
+        segments.append({
+            "index": i,
+            "start": start,
+            "source_end": source["end"],
+            "source_slot": source_slot,
+            "source_text": source["text"],
+            "translated_text": translated,
+            "target_lang": target_lang
+        })
+
     return segments
 
-async def make_tts(text, voice, output):
-    await edge_tts.Communicate(text, voice, rate=TTS_RATE).save(output)
+# ================= FAST PARALLEL TTS =================
 
-def tts_with_retry(text, voice, output):
-    for attempt in range(1, TTS_RETRIES + 1):
-        try:
-            if os.path.exists(output): os.remove(output)
-            asyncio.run(make_tts(text, voice, output))
-            if os.path.exists(output) and os.path.getsize(output) > 1000 and get_duration(output) > 0.05:
-                return True
-        except Exception as e:
-            print(f"⚠️ TTS {attempt}/{TTS_RETRIES}: {e}")
-        time.sleep(0.5)
-    return False
+def strip_dead_silence(input_file, output_file):
+    audio = AudioSegment.from_file(input_file)
+    if len(audio) == 0:
+        return
 
-def clean_audio(source, output):
-    audio = AudioSegment.from_file(source)
-    if len(audio) > 20:
-        try: audio = audio.strip_silence(silence_len=60, silence_thresh=-48, padding=25)
-        except Exception: pass
-    audio.set_frame_rate(44100).set_channels(2).export(output, format="wav")
+    start_trim = 0
+    end_trim = len(audio)
 
-def speed_audio(source, output, factor):
-    f = max(1.0, min(float(factor), 2.0))
-    run(["ffmpeg", "-y", "-i", source, "-filter:a", f"atempo={f:.6f}", "-ar", "44100", "-ac", "2", output], quiet=True)
+    for pos in range(0, len(audio), 10):
+        if audio[pos:pos + 10].dBFS > SILENCE_THRESHOLD:
+            start_trim = max(0, pos - 20)
+            break
 
-def prepare_tts(segments):
-    if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
-    os.makedirs(TEMP_DIR, exist_ok=True)
+    for pos in range(len(audio) - 10, 0, -10):
+        if audio[pos:pos + 10].dBFS > SILENCE_THRESHOLD:
+            end_trim = min(len(audio), pos + 30)
+            break
+
+    stripped = audio if end_trim <= start_trim else audio[start_trim:end_trim]
+    stripped = stripped.set_frame_rate(44100).set_channels(2)
+    stripped.export(output_file, format="wav")
+
+async def synthesize_audio(segments, temp_dir="temp_audio"):
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    print(f"🔊 Synthesizing {len(segments)} TTS clips in parallel at {TTS_RATE}...")
+    sem = asyncio.Semaphore(5)
+
+    async def fetch_one(i, seg):
+        text = seg.get("translated_text", "").strip()
+        if not text:
+            seg["clip_file"] = None
+            seg["tts_duration"] = 0
+            return
+
+        target_lang = seg.get("target_lang", "hi").lower()
+        base_lang = target_lang.split("-")[0]
+        voice = VOICE_MAP.get(base_lang, "en-US-GuyNeural")
+
+        raw_file = os.path.join(temp_dir, f"raw_{i}.mp3")
+        stripped_file = os.path.join(temp_dir, f"strip_{i}.wav")
+
+        async with sem:
+            for attempt in range(3):
+                try:
+                    communicator = edge_tts.Communicate(text, voice, rate=TTS_RATE)
+                    await communicator.save(raw_file)
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        print(f"⚠️ TTS error on segment {i}: {e}")
+                        seg["clip_file"] = None
+                        seg["tts_duration"] = 0
+                        return
+                    await asyncio.sleep(0.4)
+
+        strip_dead_silence(raw_file, stripped_file)
+        duration = get_duration(stripped_file)
+        seg["clip_file"] = stripped_file
+        seg["tts_duration"] = duration
+
+    tasks = [fetch_one(i, seg) for i, seg in enumerate(segments)]
+    await asyncio.gather(*tasks)
+
+# ================= TIMELINE =================
+
+def calculate_dub_timeline(segments):
+    current_time = 0.0
 
     for i, seg in enumerate(segments):
-        txt = clean_text(seg["translated_text"])
-        if not txt or invalid_translation(txt):
-            txt = clean_text(seg["source_text"])
-            seg["translated_text"] = txt
+        original_start = seg["start"]
+        original_slot = seg["source_slot"]
+        tts_duration = seg.get("tts_duration", 0)
 
-        voice = VOICE_MAP.get(seg["target_lang"].lower().split("-")[0], "en-US-GuyNeural")
-        raw, cln, fit = os.path.join(TEMP_DIR, f"{i:04d}_raw.mp3"), os.path.join(TEMP_DIR, f"{i:04d}_clean.wav"), os.path.join(TEMP_DIR, f"{i:04d}_fit.wav")
-        print(f"🔊 TTS {i + 1}/{len(segments)}")
+        new_start = original_start if i == 0 else current_time
+        speech_end = new_start + tts_duration
+        original_end = original_start + original_slot
 
-        success = tts_with_retry(txt, voice, raw)
-        if not success and clean_text(seg["source_text"]):
-            print("   ↳ TTS fallback to source text")
-            success = tts_with_retry(clean_text(seg["source_text"]), voice, raw)
+        visual_end = max(new_start + original_slot, speech_end)
+        freeze_duration = max(0.0, speech_end - (new_start + original_slot))
 
-        if not success:
-            print(f"❌ TTS failed: block {i + 1}")
-            seg["clip_file"], seg["tts_duration"], seg["tts_failed"] = None, 0.0, True
+        seg["new_start"] = new_start
+        seg["speech_end"] = speech_end
+        seg["original_visual_end"] = original_end
+        seg["visual_end"] = visual_end
+        seg["freeze_duration"] = freeze_duration
+
+        current_time = visual_end
+
+    return segments
+
+# ================= MASTER AUDIO =================
+
+def build_master_audio(segments, total_duration, output_file):
+    print("🎧 Building dubbed audio timeline...")
+    master = AudioSegment.silent(
+        duration=int((total_duration + 0.5) * 1000),
+        frame_rate=44100
+    ).set_channels(2)
+
+    for seg in segments:
+        clip_file = seg.get("clip_file")
+        if not clip_file or not os.path.exists(clip_file):
             continue
 
-        try:
-            clean_audio(raw, cln)
-            orig_dur = get_duration(cln)
-            slot = max(0.30, float(seg["slot"]))
-            factor = max(1.0, min(orig_dur / slot, MAX_SENTENCE_SPEED))
+        clip = AudioSegment.from_file(clip_file).set_frame_rate(44100).set_channels(2)
+        master = master.overlay(clip, position=int(seg["new_start"] * 1000))
 
-            if factor > 1.001:
-                speed_audio(cln, fit, factor)
-                final_file, final_dur = fit, get_duration(fit)
-            else:
-                final_file, final_dur = cln, orig_dur
+        seg["final_start"] = seg["new_start"]
+        seg["final_end"] = seg["speech_end"]
 
-            if final_dur <= 0.05: raise RuntimeError("TTS clip is empty.")
-            seg["clip_file"], seg["tts_duration"], seg["audio_speed"], seg["tts_failed"] = final_file, final_dur, factor, False
-            print(f"   {orig_dur:.2f}s → {final_dur:.2f}s | slot {slot:.2f}s | speed {factor:.3f}x")
-        except Exception as e:
-            print(f"❌ Audio processing failed for block {i + 1}: {e}")
-            seg["clip_file"], seg["tts_duration"], seg["tts_failed"] = None, 0.0, True
+    master.export(output_file, format="wav")
+    return output_file
 
-def calculate_timeline(segments, source_duration):
-    cur_time, acc_delay = 0.0, 0.0
-    for seg in segments:
-        st, slot = float(seg["source_start"]), float(seg["slot"])
-        dur = float(seg.get("tts_duration", 0.0))
-        tgt_st = max(st + acc_delay, cur_time)
-        acc_delay = max(acc_delay, tgt_st - st)
-        seg["audio_start"], seg["audio_end"] = tgt_st, tgt_st + dur
-        cur_time = seg["audio_end"] + 0.05
+# ================= HIGH-SPEED LOSSLESS SLICING =================
 
-        extra = dur - slot
-        if extra > 0.05 and FREEZE_ENABLED:
-            seg["freeze_duration"] = extra
-            acc_delay += extra
-        else:
-            seg["freeze_duration"] = 0.0
-    return max(source_duration + acc_delay, cur_time)
+def create_video_part(video_file, source_start, source_end, freeze_duration, output_file):
+    duration = source_end - source_start
+    if duration <= 0:
+        return False
 
-def build_master_audio(segments, total_duration, output):
-    print("🎧 Building master audio...")
-    master = AudioSegment.silent(duration=int(math.ceil((total_duration + 1.0) * 1000)), frame_rate=44100).set_channels(2)
+    filters = [
+        f"trim=start={source_start:.6f}:end={source_end:.6f}",
+        "setpts=PTS-STARTPTS"
+    ]
+
+    if ENABLE_FREEZE and freeze_duration > 0.01:
+        filters.append(f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f}")
+
+    # CRF 17 preserves near-lossless clarity during fast intermediate cuts
+    cmd = [
+        "ffmpeg", "-y", "-err_detect", "ignore_err",
+        "-i", video_file,
+        "-an",
+        "-vf", ",".join(filters),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "17",
+        "-pix_fmt", "yuv420p",
+        "-r", "30",
+        output_file
+    ]
+    run_command(cmd, quiet=True)
+    return True
+
+def concatenate_video_parts(parts, output_file):
+    concat_file = "video_concat.txt"
+    with open(concat_file, "w", encoding="utf-8") as f:
+        for part in parts:
+            absolute = os.path.abspath(part).replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{absolute}'\n")
+
+    # Fast stream copy without generation loss
+    run_command([
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_file,
+        "-c:v", "copy",
+        output_file
+    ], quiet=True)
+
+    if os.path.exists(concat_file):
+        os.remove(concat_file)
+
+def build_extended_video(video_file, segments, output_file):
+    source_duration = get_duration(video_file)
+    print("🎬 Slicing & freezing video parts (High-Fidelity Mode)...")
+
+    temp_dir = "temp_video_parts"
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir)
+
+    parts = []
+
     for i, seg in enumerate(segments):
-        cp = seg.get("clip_file")
-        if not cp or not os.path.exists(cp): continue
-        try:
-            clip = AudioSegment.from_file(cp).set_frame_rate(44100).set_channels(2)
-            master = master.overlay(clip, position=max(0, int(round(seg["audio_start"] * 1000))))
-        except Exception as e:
-            print(f"⚠️ Audio overlay error block {i + 1}: {e}")
-    master.export(output, format="wav")
-    print("✅ Master audio created")
+        source_start = seg["start"]
+        if i == 0 and source_start > 0.01:
+            opening = os.path.join(temp_dir, "part_000_opening.mp4")
+            create_video_part(video_file, 0, source_start, 0, opening)
+            parts.append(opening)
 
-def render_video(source, segments, source_duration, output):
-    print("🎬 Rendering synchronized video...")
-    filters, labels, l_num, prev_end = [], [], 0, 0.0
+        source_end = segments[i + 1]["start"] if (i + 1 < len(segments)) else source_duration
+        source_end = min(source_end, source_duration)
+        if source_end <= source_start:
+            continue
 
-    def new_lbl():
-        nonlocal l_num
-        lbl = f"v{l_num}"
-        l_num += 1
-        return lbl
+        freeze_duration = seg.get("freeze_duration", 0)
+        part_file = os.path.join(temp_dir, f"part_{i+1:04d}.mp4")
+        create_video_part(video_file, source_start, source_end, freeze_duration, part_file)
+        parts.append(part_file)
 
-    for seg in segments:
-        st, ed, frz = float(seg["source_start"]), float(seg["source_end"]), float(seg.get("freeze_duration", 0.0))
-        if st > prev_end + 0.01:
-            lbl = new_lbl()
-            filters.append(f"[0:v]trim=start={prev_end:.6f}:end={st:.6f},setpts=PTS-STARTPTS[{lbl}]")
-            labels.append(f"[{lbl}]")
+    if not parts:
+        raise RuntimeError("No video parts created.")
 
-        lbl = new_lbl()
-        chunk = f"[0:v]trim=start={st:.6f}:end={ed:.6f},setpts=PTS-STARTPTS"
-        if FREEZE_ENABLED and frz > 0.02:
-            chunk += f",tpad=stop_mode=clone:stop_duration={frz:.6f}"
-        filters.append(chunk + f"[{lbl}]")
-        labels.append(f"[{lbl}]")
-        prev_end = ed
+    concatenate_video_parts(parts, output_file)
+    return output_file
 
-    if prev_end < source_duration - 0.01:
-        lbl = new_lbl()
-        filters.append(f"[0:v]trim=start={prev_end:.6f}:end={source_duration:.6f},setpts=PTS-STARTPTS[{lbl}]")
-        labels.append(f"[{lbl}]")
+# ================= FINAL MUX & ANTI-FINGERPRINT TRANSFORMATION =================
 
-    if not labels:
-        lbl = new_lbl()
-        filters.append(f"[0:v]setpts=PTS-STARTPTS[{lbl}]")
-        labels.append(f"[{lbl}]")
+def mux_final_video(extended_video, dubbed_audio, output_file):
+    pct = int(round((FINAL_SPEED - 1.0) * 100))
+    print(f"🎬 Applying anti-fingerprint filters & +{pct}% speedup @ CRF {FINAL_CRF}...")
 
-    if len(labels) == 1:
-        filters.append(f"{labels[0]}setpts=PTS-STARTPTS[joined]")
-    else:
-        filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0,setpts=PTS-STARTPTS[joined]")
+    # 1. Visual Disruption Filter Chain:
+    # - 4% Dynamic Center Crop: breaks coordinate/geometry hashes (Meta TMK/PDQ)
+    # - Color Grading (eq): shifts color temperature, contrast, and histogram curves
+    # - Temporal Micro-Grain (noise): breaks static frame hash without visible degradation
+    # - Speed & Framerate normalization: alters frame playback cadence
+    video_filters = [
+        "crop=w='trunc(in_w*0.96/2)*2':h='trunc(in_h*0.96/2)*2':x='(in_w-out_w)/2':y='(in_h-out_h)/2'",
+        "eq=contrast=1.06:brightness=0.01:saturation=1.07:gamma=1.02",
+        "noise=alls=3:allf=t",
+        f"setpts=PTS/{FINAL_SPEED:.4f}",
+        "fps=30"
+    ]
+    video_filter_str = ",".join(video_filters)
 
-    filters.append(f"[joined]setpts=PTS/{FINAL_SPEED:.6f}[vout]")
-    run([
-        "ffmpeg", "-y", "-i", source, "-filter_complex", ";".join(filters),
-        "-map", "[vout]", "-an", "-c:v", "libx264", "-preset", VIDEO_PRESET,
-        "-crf", VIDEO_CRF, "-pix_fmt", "yuv420p", "-movflags", "+faststart", output
-    ], quiet=False)
+    # 2. Audio Acoustic Disruption:
+    # - atempo: speeds up audio to match video acceleration
+    # - equalizer: reshapes speech formants so TTS voice models aren't recognized as raw cloud synthesis
+    # - highpass/lowpass: eliminates digital silence floor and synthetic frequency spikes
+    audio_filters = [
+        f"atempo={FINAL_SPEED:.4f}",
+        "equalizer=f=250:t=q:w=1:g=1.5",
+        "equalizer=f=3500:t=q:w=1:g=1.2",
+        "highpass=f=75",
+        "lowpass=f=14000",
+        "volume=1.05"
+    ]
+    audio_filter_str = ",".join(audio_filters)
 
-    if not os.path.exists(output): raise RuntimeError("Video rendering failed.")
+    run_command([
+        "ffmpeg", "-y",
+        "-i", extended_video,
+        "-i", dubbed_audio,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-vf", video_filter_str,
+        "-af", audio_filter_str,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", FINAL_CRF,
+        "-maxrate", MAX_VIDEO_BITRATE,
+        "-bufsize", BUFFER_SIZE,
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", AUDIO_BITRATE,
+        "-movflags", "+faststart",
+        "-map_metadata", "-1",
+        "-map_chapters", "-1",
+        output_file
+    ])
 
-def mux_final(video, audio, output):
-    print("🎧 Muxing final MP4...")
-    tmp = output + ".tmp.mp4"
-    if os.path.exists(tmp): os.remove(tmp)
-    run([
-        "ffmpeg", "-y", "-i", video, "-i", audio, "-map", "0:v:0", "-map", "1:a:0",
-        "-af", f"atempo={FINAL_SPEED:.6f}", "-c:v", "copy", "-c:a", "aac",
-        "-b:a", AUDIO_BITRATE, "-movflags", "+faststart", "-shortest", tmp
-    ], quiet=False)
-    if not os.path.exists(tmp): raise RuntimeError("Final MP4 was not generated.")
-    if os.path.exists(output): os.remove(output)
-    os.replace(tmp, output)
+# ================= SRT SUBTITLES =================
 
-def timestamp(sec):
-    ms = max(0, int(round(sec * 1000)))
-    h, ms = ms // 3600000, ms % 3600000
-    m, ms = ms // 60000, ms % 60000
-    return f"{h:02d}:{m:02d}:{ms // 1000:02d},{ms % 1000:03d}"
+def format_timestamp(seconds):
+    seconds = max(0.0, seconds)
+    total_ms = int(round(seconds * 1000))
+    hours = total_ms // 3600000
+    total_ms %= 3600000
+    minutes = total_ms // 60000
+    total_ms %= 60000
+    secs = total_ms // 1000
+    millis = total_ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
-def write_srt(segments, output):
-    print("📝 Writing SRT...")
-    cnt = 0
-    with open(output, "w", encoding="utf-8") as f:
+def generate_srt(segments, output_file="subtitles.srt"):
+    print("📝 Creating synchronized subtitles...")
+    with open(output_file, "w", encoding="utf-8") as f:
+        index = 1
         for seg in segments:
-            txt = clean_text(seg.get("translated_text", ""))
-            if not txt: continue
-            cnt += 1
-            st, ed = float(seg["audio_start"]) / FINAL_SPEED, float(seg["audio_end"]) / FINAL_SPEED
-            f.write(f"{cnt}\n{timestamp(st)} --> {timestamp(ed)}\n{txt}\n\n")
-    print(f"✅ SRT: {cnt} subtitles")
+            text = seg.get("translated_text", "").strip()
+            if not text:
+                continue
+
+            start = seg.get("final_start", seg["new_start"]) / FINAL_SPEED
+            end = seg.get("final_end", seg["speech_end"]) / FINAL_SPEED
+
+            if end <= start:
+                end = start + 0.5
+
+            f.write(f"{index}\n{format_timestamp(start)} --> {format_timestamp(end)}\n{text}\n\n")
+            index += 1
+
+# ================= CLEANUP =================
 
 def cleanup():
-    for p in (TEMP_DIR, "raw_source.mp4", "input_audio.wav", "synced_master.wav", "extended_video.mp4"):
-        try:
-            if os.path.isdir(p): shutil.rmtree(p)
-            elif os.path.exists(p): os.remove(p)
-        except Exception: pass
+    for directory in ("temp_audio", "temp_video_parts"):
+        if os.path.exists(directory):
+            try:
+                shutil.rmtree(directory)
+            except Exception:
+                pass
 
-def main():
+    for file in ("raw_source.mp4", "input_audio.wav", "synced_master.wav", "extended_video.mp4", "video_concat.txt"):
+        if os.path.exists(file):
+            try:
+                os.remove(file)
+            except Exception:
+                pass
+
+# ================= MAIN =================
+
+if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print('Usage: python dubber.py "VIDEO_URL" [language]')
+        print('Usage: python dub.py "VIDEO_URL" [target_language]')
         sys.exit(1)
 
-    url = sys.argv[1]
-    tgt_lang = sys.argv[2].lower() if len(sys.argv) > 2 else "hi"
-    started = time.time()
+    video_url = sys.argv[1]
+    target_language = (sys.argv[2] if len(sys.argv) > 2 else "hi").lower()
 
-    print("\n" + "=" * 65 + "\n                 AI VIDEO DUBBER\n" + "=" * 65)
-    print(f"Target: {tgt_lang} | Final speed: {FINAL_SPEED} | Freeze: {FREEZE_ENABLED}\n" + "=" * 65 + "\n")
+    print()
+    print("=" * 55)
+    print("AI DUBBING ENGINE (TRANSFORMATIVE / ANTI-FINGERPRINT)")
+    print("=" * 55)
+    print(f"Target language : {target_language}")
+    print(f"TTS Speech rate : {TTS_RATE}")
+    print(f"Master speedup  : {FINAL_SPEED}x (+{int(round((FINAL_SPEED - 1.0) * 100))}%)")
+    print(f"Video Quality   : CRF {FINAL_CRF}")
+    print("=" * 55)
+    print()
+
+    t_start = time.time()
 
     try:
-        src_v, src_a, meta = download_media(url)
-        src_dur = get_duration(src_v)
-        print(f"Source duration: {src_dur:.2f}s | Size: {size_mb(src_v):.2f} MB")
+        video_file, audio_file, metadata = download_media(video_url)
 
-        segments = transcribe(src_a, tgt_lang)
-        if not segments: raise RuntimeError("No speech detected.")
+        segments = transcribe_and_translate(audio_file, target_language)
+        if not segments:
+            raise RuntimeError("No speech segments detected.")
 
-        prepare_tts(segments)
-        out_dur = calculate_timeline(segments, src_dur)
-        print(f"Timeline duration: {out_dur:.2f}s")
+        asyncio.run(synthesize_audio(segments))
+        calculate_dub_timeline(segments)
 
-        build_master_audio(segments, out_dur, "synced_master.wav")
-        write_srt(segments, OUTPUT_SRT)
-        render_video(src_v, segments, src_dur, "extended_video.mp4")
-        mux_final("extended_video.mp4", "synced_master.wav", OUTPUT_VIDEO)
+        final_duration = max(
+            get_duration(video_file),
+            max((seg["visual_end"] for seg in segments), default=0.0)
+        )
 
-        if not os.path.exists(OUTPUT_VIDEO): raise RuntimeError("final_output.mp4 not created.")
+        master_audio = "synced_master.wav"
+        build_master_audio(segments, final_duration, master_audio)
 
-        fails = sum(1 for s in segments if s.get("tts_failed", False))
-        print("\n" + "=" * 65 + "\n                    COMPLETE\n" + "=" * 65)
-        print(f"Final size: {size_mb(OUTPUT_VIDEO):.2f} MB | Final duration: {get_duration(OUTPUT_VIDEO):.2f}s")
-        print(f"TTS failures: {fails} | Time taken: {(time.time() - started) / 60:.2f} min")
-        print("🎬 final_output.mp4 | 📝 subtitles.srt\n" + "=" * 65)
+        extended_video = "extended_video.mp4"
+        build_extended_video(video_file, segments, extended_video)
+
+        mux_final_video(extended_video, master_audio, "final_output.mp4")
+        generate_srt(segments, "subtitles.srt")
+
+        orig_dur = get_duration(video_file)
+        final_dur = get_duration("final_output.mp4")
+        orig_mb = os.path.getsize(video_file) / (1024 * 1024)
+        final_mb = os.path.getsize("final_output.mp4") / (1024 * 1024)
+        total_time = time.time() - t_start
+
+        print()
+        print("=" * 55)
+        print("✅ DUBBING COMPLETE")
+        print("=" * 55)
+        print(f"Execution time    : {total_time:.1f}s (~{total_time/60:.1f} min)")
+        print(f"Original size     : {orig_mb:.2f} MB")
+        print(f"Final size        : {final_mb:.2f} MB")
+        print(f"Original duration : {orig_dur:.2f}s")
+        print(f"Final duration    : {final_dur:.2f}s")
+        print("=" * 55)
 
         cleanup()
 
     except Exception as e:
-        print("\n" + "=" * 65 + "\n                    FAILED\n" + "=" * 65)
-        print(f"❌ {e}\nTemporary files retained.\n" + "=" * 65)
+        print()
+        print("=" * 55)
+        print("❌ DUBBING FAILED")
+        print(f"Error: {e}")
+        print("=" * 55)
         raise
-
-if __name__ == "__main__":
-    main()
