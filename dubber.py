@@ -6,6 +6,8 @@ import time
 import re
 import json
 import shutil
+import urllib.request
+import urllib.parse
 import yt_dlp
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator, MyMemoryTranslator
@@ -14,19 +16,16 @@ from pydub import AudioSegment
 
 # ================= CONFIG =================
 
-# 1. Pacing & Speed
-TTS_RATE = "+15%"          # Fast, natural delivery
-FINAL_SPEED = 1.10         # Exact +10% uniform master speedup
+TTS_RATE = "+15%"
+FINAL_SPEED = 1.10
 
-# 2. Timing Controls
 ENABLE_FREEZE = True
 SAFETY_GAP = 0.03
 SILENCE_THRESHOLD = -42
 WHISPER_MODEL = "tiny"
 
-# 3. Quality & Bitrate Controls (Crisp 1080p/720p with compact 12-16 MB size)
-FINAL_CRF = "22"           # Studio-grade visual quality
-MAX_VIDEO_BITRATE = "2200k"# Bitrate ceiling to prevent file bloat
+FINAL_CRF = "22"
+MAX_VIDEO_BITRATE = "2200k"
 BUFFER_SIZE = "4400k"
 AUDIO_BITRATE = "128k"
 
@@ -76,6 +75,18 @@ def get_duration(path):
     ])
     return float(result.strip())
 
+def get_system_font():
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
 # ================= DOWNLOAD =================
 
 def download_media(url):
@@ -124,48 +135,53 @@ def download_media(url):
 
     return video_path, audio_path, metadata
 
-# ================= TRANSLATION =================
+# ================= TRANSLATION ENGINE =================
 
 def contains_devanagari(text):
     return bool(re.search(r"[\u0900-\u097F]", text))
 
-def is_error_page(text):
-    t = text.lower()
-    return any(x in t for x in (
-        "server error", "500", "!!1500", "<!doctype", "<html", "captcha", "unusual traffic"
-    ))
+def translate_gtx(text, target_lang="hi"):
+    """Direct API query to prevent scraper blocks and rate-limiting."""
+    try:
+        encoded = urllib.parse.quote(text)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={encoded}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            pieces = [part[0] for part in data[0] if part[0]]
+            return "".join(pieces).strip()
+    except Exception:
+        return ""
 
 def translate_text(text, target_lang):
     text = re.sub(r"[\r\n\t]+", " ", text).strip()
     if not text or len(text) < 2:
         return text
 
-    if target_lang == "hi":
-        for _ in range(3):
-            try:
-                result = GoogleTranslator(source="auto", target="hi").translate(text)
-                if result and not is_error_page(result) and contains_devanagari(result):
-                    return result.strip()
-            except Exception:
-                time.sleep(0.2)
+    # Strategy 1: High-quota direct endpoint
+    res = translate_gtx(text, target_lang)
+    if res and (target_lang != "hi" or contains_devanagari(res)):
+        return res
 
+    # Strategy 2: GoogleTranslator
+    for _ in range(2):
         try:
-            result = MyMemoryTranslator(source="auto", target="hi-IN").translate(text)
-            if result and not is_error_page(result) and contains_devanagari(result):
-                return result.strip()
-        except Exception:
-            pass
-        return ""
-
-    for _ in range(3):
-        try:
-            result = GoogleTranslator(source="auto", target=target_lang).translate(text)
-            if result and not is_error_page(result):
-                return result.strip()
+            res = GoogleTranslator(source="auto", target=target_lang).translate(text)
+            if res and (target_lang != "hi" or contains_devanagari(res)):
+                return res.strip()
         except Exception:
             time.sleep(0.2)
 
-    return text
+    # Strategy 3: MyMemory Fallback
+    try:
+        tgt = "hi-IN" if target_lang == "hi" else target_lang
+        res = MyMemoryTranslator(source="auto", target=tgt).translate(text)
+        if res and (target_lang != "hi" or contains_devanagari(res)):
+            return res.strip()
+    except Exception:
+        pass
+
+    return ""
 
 # ================= WHISPER =================
 
@@ -345,7 +361,7 @@ def build_master_audio(segments, total_duration, output_file):
     master.export(output_file, format="wav")
     return output_file
 
-# ================= HIGH-SPEED LOSSLESS SLICING =================
+# ================= HIGH-SPEED SLICING =================
 
 def create_video_part(video_file, source_start, source_end, freeze_duration, output_file):
     duration = source_end - source_start
@@ -360,7 +376,6 @@ def create_video_part(video_file, source_start, source_end, freeze_duration, out
     if ENABLE_FREEZE and freeze_duration > 0.01:
         filters.append(f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f}")
 
-    # CRF 17 preserves near-lossless clarity during fast intermediate cuts
     cmd = [
         "ffmpeg", "-y", "-err_detect", "ignore_err",
         "-i", video_file,
@@ -383,7 +398,6 @@ def concatenate_video_parts(parts, output_file):
             absolute = os.path.abspath(part).replace("\\", "/").replace("'", "'\\''")
             f.write(f"file '{absolute}'\n")
 
-    # Fast stream copy without generation loss
     run_command([
         "ffmpeg", "-y",
         "-f", "concat",
@@ -398,7 +412,7 @@ def concatenate_video_parts(parts, output_file):
 
 def build_extended_video(video_file, segments, output_file):
     source_duration = get_duration(video_file)
-    print("🎬 Slicing & freezing video parts (High-Fidelity Mode)...")
+    print("🎬 Slicing & freezing video parts...")
 
     temp_dir = "temp_video_parts"
     if os.path.exists(temp_dir):
@@ -430,30 +444,33 @@ def build_extended_video(video_file, segments, output_file):
     concatenate_video_parts(parts, output_file)
     return output_file
 
-# ================= FINAL MUX & ANTI-FINGERPRINT TRANSFORMATION =================
+# ================= FINAL MUX & MOVING WATERMARK =================
 
 def mux_final_video(extended_video, dubbed_audio, output_file):
     pct = int(round((FINAL_SPEED - 1.0) * 100))
-    print(f"🎬 Applying anti-fingerprint filters & +{pct}% speedup @ CRF {FINAL_CRF}...")
+    print(f"🎬 Applying moving logo, anti-fingerprint filters & +{pct}% speedup...")
 
-    # 1. Visual Disruption Filter Chain:
-    # - 4% Dynamic Center Crop: breaks coordinate/geometry hashes (Meta TMK/PDQ)
-    # - Color Grading (eq): shifts color temperature, contrast, and histogram curves
-    # - Temporal Micro-Grain (noise): breaks static frame hash without visible degradation
-    # - Speed & Framerate normalization: alters frame playback cadence
+    font_path = get_system_font()
+    font_arg = f"fontfile='{font_path}':" if font_path else ""
+
+    # Animated Lissajous trajectory for transparent "Movies Jet" watermark
+    watermark_filter = (
+        f"drawtext={font_arg}text='Movies Jet':fontsize=h/42:"
+        f"fontcolor=white@0.30:bordercolor=black@0.18:borderw=1:"
+        f"x='(w-tw)/2+((w-tw)/2.3)*sin(t*0.4)':"
+        f"y='(h-th)/2+((h-th)/2.3)*cos(t*0.6)'"
+    )
+
     video_filters = [
         "crop=w='trunc(in_w*0.96/2)*2':h='trunc(in_h*0.96/2)*2':x='(in_w-out_w)/2':y='(in_h-out_h)/2'",
         "eq=contrast=1.06:brightness=0.01:saturation=1.07:gamma=1.02",
         "noise=alls=3:allf=t",
+        watermark_filter,
         f"setpts=PTS/{FINAL_SPEED:.4f}",
         "fps=30"
     ]
     video_filter_str = ",".join(video_filters)
 
-    # 2. Audio Acoustic Disruption:
-    # - atempo: speeds up audio to match video acceleration
-    # - equalizer: reshapes speech formants so TTS voice models aren't recognized as raw cloud synthesis
-    # - highpass/lowpass: eliminates digital silence floor and synthetic frequency spikes
     audio_filters = [
         f"atempo={FINAL_SPEED:.4f}",
         "equalizer=f=250:t=q:w=1:g=1.5",
@@ -546,7 +563,7 @@ if __name__ == "__main__":
 
     print()
     print("=" * 55)
-    print("AI DUBBING ENGINE (TRANSFORMATIVE / ANTI-FINGERPRINT)")
+    print("AI DUBBING ENGINE (WATERMARKED & ROBUST)")
     print("=" * 55)
     print(f"Target language : {target_language}")
     print(f"TTS Speech rate : {TTS_RATE}")
