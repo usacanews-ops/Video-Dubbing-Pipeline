@@ -1,16 +1,21 @@
 package com.example.moviedubber
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -26,7 +31,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -34,6 +38,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -55,7 +60,6 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 
-// --- Modern Lively Color Palette ---
 val PrimaryIndigo = Color(0xFF4F46E5)
 val AccentCyan = Color(0xFF06B6D4)
 val EmeraldSuccess = Color(0xFF10B981)
@@ -85,7 +89,8 @@ data class HistoryItem(
     val srtUrl: String,
     val timestamp: String,
     var sourceMetaText: String = "",
-    var isUploaded: Boolean = false
+    var isUploaded: Boolean = false,
+    val deviceId: String = ""
 )
 
 class ProgressRequestBody(
@@ -93,10 +98,8 @@ class ProgressRequestBody(
     private val contentType: MediaType,
     private val onProgressUpdate: (percentage: Int, bytesWritten: Long, totalBytes: Long) -> Unit
 ) : RequestBody() {
-
     override fun contentType(): MediaType = contentType
     override fun contentLength(): Long = file.length()
-
     override fun writeTo(sink: BufferedSink) {
         val totalLength = contentLength()
         val countingSink = object : ForwardingSink(sink) {
@@ -108,12 +111,40 @@ class ProgressRequestBody(
                 onProgressUpdate(progress, bytesWritten, totalLength)
             }
         }
-        val bufferedCountingSink = countingSink.buffer()
+        val buffered = countingSink.buffer()
         file.source().use { source ->
-            bufferedCountingSink.writeAll(source)
-            bufferedCountingSink.flush()
+            buffered.writeAll(source)
+            buffered.flush()
         }
     }
+}
+
+class DubberForegroundService : Service() {
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        val channelId = "dubber_background_channel"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "Dubber Background Pipeline",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+        val notification: Notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("MovieDubber Processing")
+            .setContentText("Dubbing tasks active in background...")
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setOngoing(true)
+            .build()
+
+        startForeground(1001, notification)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 }
 
 object DubberQueueManager {
@@ -125,43 +156,119 @@ object DubberQueueManager {
     var queueSize by mutableStateOf(0)
     var historyList = mutableStateListOf<HistoryItem>()
 
-    // Reconnection tracking states
     var activeRunId by mutableStateOf<Long?>(null)
     var canReconnect by mutableStateOf(false)
     var hasCloudError by mutableStateOf(false)
 
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    // Unique per-device identification
+    fun getDeviceId(context: Context): String {
+        val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
+        var devId = prefs.getString("device_id", null)
+        if (devId.isNullOrBlank()) {
+            devId = UUID.randomUUID().toString().replace("-", "").take(8)
+            prefs.edit().putString("device_id", devId).apply()
+        }
+        return devId
+    }
+
+    // Rolling cap of max 25 deleted IDs
+    fun getDeletedRunIds(context: Context): List<String> {
+        val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
+        val raw = prefs.getString("deleted_run_ids", "[]") ?: "[]"
+        val list = mutableListOf<String>()
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) list.add(arr.getString(i))
+        } catch (_: Exception) {}
+        return list
+    }
+
+    fun markRunDeleted(context: Context, runId: String) {
+        val current = getDeletedRunIds(context).toMutableList()
+        if (!current.contains(runId)) {
+            current.add(0, runId)
+        }
+        while (current.size > 25) {
+            current.removeAt(current.size - 1)
+        }
+        val arr = JSONArray()
+        current.forEach { arr.put(it) }
+        context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
+            .edit().putString("deleted_run_ids", arr.toString()).apply()
+    }
+
+    fun saveQueue(context: Context) {
+        val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
+        val arr = JSONArray()
+        for (item in queue) {
+            val obj = JSONObject().apply {
+                put("id", item.id)
+                put("videoUrl", item.videoUrl)
+                put("targetLang", item.targetLang)
+                put("speed", item.speed.toDouble())
+            }
+            arr.put(obj)
+        }
+        prefs.edit().putString("pending_queue_json", arr.toString()).apply()
+    }
+
+    fun loadQueue(context: Context) {
+        val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
+        val jsonStr = prefs.getString("pending_queue_json", "[]") ?: "[]"
+        try {
+            val arr = JSONArray(jsonStr)
+            queue.clear()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                queue.add(
+                    QueueItem(
+                        id = obj.getLong("id"),
+                        videoUrl = obj.getString("videoUrl"),
+                        targetLang = obj.optString("targetLang", "hi"),
+                        speed = obj.optDouble("speed", 1.0).toFloat()
+                    )
+                )
+            }
+            queueSize = queue.size
+        } catch (_: Exception) {}
+    }
+
     fun loadHistory(context: Context) {
         val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
+        val myDeviceId = getDeviceId(context)
         val jsonStr = prefs.getString("history_json", "[]") ?: "[]"
         try {
             val arr = JSONArray(jsonStr)
             historyList.clear()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
-                historyList.add(
-                    HistoryItem(
-                        id = obj.getString("id"),
-                        title = obj.optString("title", "Dubbed Video"),
-                        downloadUrl = obj.getString("downloadUrl"),
-                        srtUrl = obj.optString("srtUrl", ""),
-                        timestamp = obj.getString("timestamp"),
-                        sourceMetaText = obj.optString("sourceMetaText", ""),
-                        isUploaded = obj.optBoolean("isUploaded", false)
+                val itemDevId = obj.optString("deviceId", myDeviceId)
+                if (itemDevId == myDeviceId) {
+                    historyList.add(
+                        HistoryItem(
+                            id = obj.getString("id"),
+                            title = obj.optString("title", "Dubbed Video"),
+                            downloadUrl = obj.getString("downloadUrl"),
+                            srtUrl = obj.optString("srtUrl", ""),
+                            timestamp = obj.getString("timestamp"),
+                            sourceMetaText = obj.optString("sourceMetaText", ""),
+                            isUploaded = obj.optBoolean("isUploaded", false),
+                            deviceId = itemDevId
+                        )
                     )
-                )
+                }
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
 
-        val savedRunId = prefs.getLong("last_active_run_id", 0L)
-        if (savedRunId != 0L) {
-            activeRunId = savedRunId
-            canReconnect = true
-            hasCloudError = true
-            currentStatus = "Cloud Connectivity Error."
+        loadQueue(context)
+
+        // Perform bidirectional cloud reconciliation
+        coroutineScope.launch {
+            syncWithCloudOnStartup(context)
         }
     }
 
@@ -176,6 +283,7 @@ object DubberQueueManager {
                 put("timestamp", h.timestamp)
                 put("sourceMetaText", h.sourceMetaText)
                 put("isUploaded", h.isUploaded)
+                put("deviceId", h.deviceId)
             }
             arr.put(obj)
         }
@@ -184,18 +292,21 @@ object DubberQueueManager {
     }
 
     fun removeItem(context: Context, item: HistoryItem) {
+        markRunDeleted(context, item.id)
         historyList.remove(item)
         saveHistory(context)
     }
 
     fun clearAll(context: Context) {
+        historyList.forEach { markRunDeleted(context, it.id) }
         historyList.clear()
         saveHistory(context)
     }
 
     fun addHistoryItem(context: Context, item: HistoryItem) {
+        if (historyList.any { it.id == item.id }) return
         historyList.add(0, item)
-        while (historyList.size > 10) {
+        while (historyList.size > 25) {
             historyList.removeAt(historyList.size - 1)
         }
         saveHistory(context)
@@ -204,22 +315,47 @@ object DubberQueueManager {
     fun enqueue(item: QueueItem, context: Context) {
         queue.add(item)
         queueSize = queue.size
+        saveQueue(context)
         processNext(context.applicationContext)
     }
 
+    fun startService(context: Context) {
+        try {
+            val intent = Intent(context, DubberForegroundService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun stopService(context: Context) {
+        try {
+            context.stopService(Intent(context, DubberForegroundService::class.java))
+        } catch (_: Exception) {}
+    }
+
     fun processNext(context: Context) {
-        if (isProcessing || queue.isEmpty()) return
+        if (isProcessing || queue.isEmpty()) {
+            if (queue.isEmpty() && !isProcessing) stopService(context)
+            return
+        }
 
         val nextItem = queue.poll() ?: return
         queueSize = queue.size
+        saveQueue(context)
+
         isProcessing = true
         canReconnect = false
         hasCloudError = false
+        startService(context)
 
         val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
         val owner = prefs.getString("owner", "usacanews-ops") ?: ""
         val repo = prefs.getString("repo", "Video-Dubbing-Pipeline") ?: ""
         val token = prefs.getString("token", "") ?: ""
+        val devId = getDeviceId(context)
 
         coroutineScope.launch {
             executeCloudDubbingPipeline(
@@ -230,6 +366,7 @@ object DubberQueueManager {
                 videoUrl = nextItem.videoUrl.trim(),
                 targetLang = nextItem.targetLang,
                 speed = nextItem.speed,
+                deviceId = devId,
                 onStatusUpdate = { status, log, preview ->
                     currentStatus = status
                     detailedLogs = log
@@ -265,11 +402,13 @@ object DubberQueueManager {
         canReconnect = false
         hasCloudError = false
         currentStatus = "Re-establishing connection..."
+        startService(context)
 
         val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
         val owner = prefs.getString("owner", "usacanews-ops") ?: ""
         val repo = prefs.getString("repo", "Video-Dubbing-Pipeline") ?: ""
         val token = prefs.getString("token", "") ?: ""
+        val devId = getDeviceId(context)
 
         coroutineScope.launch {
             monitorCloudRun(
@@ -278,6 +417,7 @@ object DubberQueueManager {
                 repo = repo.trim(),
                 token = token.trim(),
                 runId = runId,
+                deviceId = devId,
                 onStatusUpdate = { status, log, preview ->
                     currentStatus = status
                     detailedLogs = log
@@ -303,6 +443,154 @@ object DubberQueueManager {
                 }
             )
         }
+    }
+
+    // Bidirectional reconciliation after deep sleep / app launch
+    suspend fun syncWithCloudOnStartup(context: Context) = withContext(Dispatchers.IO) {
+        val prefs = context.getSharedPreferences("DubberPrefs", Context.MODE_PRIVATE)
+        val owner = prefs.getString("owner", "usacanews-ops")?.trim() ?: ""
+        val repo = prefs.getString("repo", "Video-Dubbing-Pipeline")?.trim() ?: ""
+        val token = prefs.getString("token", "")?.trim() ?: ""
+        val myDeviceId = getDeviceId(context)
+
+        if (owner.isBlank() || repo.isBlank() || token.isBlank()) return@withContext
+
+        val client = OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS).build()
+        val authHeader = "Bearer $token"
+        val deletedIds = getDeletedRunIds(context)
+
+        try {
+            // 1. Recover completed releases generated while device was asleep
+            val releasesUrl = "https://api.github.com/repos/$owner/$repo/releases?per_page=25"
+            val relReq = Request.Builder().url(releasesUrl).addHeader("Authorization", authHeader).build()
+            val relRes = client.newCall(relReq).execute()
+
+            if (relRes.isSuccessful) {
+                val relArray = JSONArray(relRes.body?.string() ?: "[]")
+                for (i in 0 until relArray.length()) {
+                    val rel = relArray.getJSONObject(i)
+                    val tagName = rel.optString("tag_name", "")
+                    
+                    // Match releases created by this specific device
+                    if (tagName.startsWith("release-$myDeviceId-")) {
+                        val runIdStr = tagName.removePrefix("release-$myDeviceId-")
+                        
+                        // Ignore if deleted manually by user
+                        if (deletedIds.contains(runIdStr)) continue
+                        if (historyList.any { it.id == runIdStr }) continue
+
+                        var videoUrl = ""
+                        var srtUrl = ""
+                        var sourceMeta = ""
+                        var title = "Dubbed Video"
+
+                        val assets = rel.optJSONArray("assets")
+                        if (assets != null) {
+                            for (j in 0 until assets.length()) {
+                                val asset = assets.getJSONObject(j)
+                                val name = asset.getString("name")
+                                val downloadUrl = asset.getString("browser_download_url")
+
+                                when {
+                                    name.endsWith(".mp4") -> videoUrl = downloadUrl
+                                    name.endsWith(".srt") -> srtUrl = downloadUrl
+                                    name == "source_meta.json" -> {
+                                        try {
+                                            val mReq = Request.Builder().url(downloadUrl).addHeader("Authorization", authHeader).build()
+                                            val mRes = client.newCall(mReq).execute()
+                                            val parsed = JSONObject(mRes.body?.string() ?: "{}")
+                                            title = parsed.optString("title", title)
+                                            sourceMeta = "TITLE:\n${parsed.optString("title")}\n\nTAGS:\n${parsed.optJSONArray("tags")}\n\nDESCRIPTION:\n${parsed.optString("description")}"
+                                        } catch (_: Exception) {}
+                                    }
+                                }
+                            }
+                        }
+
+                        if (videoUrl.isNotBlank()) {
+                            withContext(Dispatchers.Main) {
+                                addHistoryItem(
+                                    context,
+                                    HistoryItem(
+                                        id = runIdStr,
+                                        title = title,
+                                        downloadUrl = videoUrl,
+                                        srtUrl = srtUrl,
+                                        timestamp = "Recovered",
+                                        sourceMetaText = sourceMeta,
+                                        isUploaded = false,
+                                        deviceId = myDeviceId
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Check for an active running task initiated by this device
+            val runsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs?per_page=15"
+            val runsReq = Request.Builder().url(runsUrl).addHeader("Authorization", authHeader).build()
+            val runsRes = client.newCall(runsReq).execute()
+
+            if (runsRes.isSuccessful) {
+                val runsJson = JSONObject(runsRes.body?.string() ?: "{}")
+                val runsArray = runsJson.optJSONArray("workflow_runs")
+                if (runsArray != null) {
+                    for (i in 0 until runsArray.length()) {
+                        val run = runsArray.getJSONObject(i)
+                        val runName = run.optString("name", "")
+                        val status = run.optString("status", "")
+                        val runId = run.getLong("id")
+
+                        // Reattach to in_progress or queued runs belonging to this device
+                        if (runName.contains("[$myDeviceId]") && (status == "in_progress" || status == "queued")) {
+                            withContext(Dispatchers.Main) {
+                                activeRunId = runId
+                                isProcessing = true
+                                canReconnect = false
+                                hasCloudError = false
+                                currentStatus = "⚙️ Re-attached to active run #$runId"
+                                startService(context)
+                                coroutineScope.launch {
+                                    monitorCloudRun(
+                                        context, owner, repo, token, runId, myDeviceId,
+                                        onStatusUpdate = { s, l, p ->
+                                            currentStatus = s
+                                            detailedLogs = l
+                                            if (p.isNotBlank()) {
+                                                val words = p.trim().split(Regex("\\s+"))
+                                                firstLinePreview = if (words.size > 5) words.take(5).joinToString(" ") + "..." else p
+                                            }
+                                        },
+                                        onComplete = { _, _ ->
+                                            isProcessing = false
+                                            activeRunId = null
+                                            processNext(context)
+                                        },
+                                        onError = { _ ->
+                                            isProcessing = false
+                                            canReconnect = true
+                                            hasCloudError = true
+                                            currentStatus = "Cloud Connectivity Error."
+                                        }
+                                    )
+                                }
+                            }
+                            return@withContext
+                        }
+                    }
+                }
+            }
+
+            // 3. If nothing is actively running on server, resume waiting local queue
+            withContext(Dispatchers.Main) {
+                if (!isProcessing && queue.isNotEmpty()) {
+                    processNext(context)
+                }
+            }
+
+        } catch (_: Exception) {}
     }
 }
 
@@ -391,6 +679,7 @@ fun DubberLiveApp() {
     var isUploadingToFb by remember { mutableStateOf(false) }
 
     var activeMetadataDialog by remember { mutableStateOf<String?>(null) }
+    val deviceId = remember { DubberQueueManager.getDeviceId(context) }
 
     val pageAccounts = remember(fbPagesRaw) {
         fbPagesRaw.lines().mapNotNull { line ->
@@ -405,7 +694,6 @@ fun DubberLiveApp() {
         mutableStateOf(pageAccounts.firstOrNull())
     }
 
-    // Selectable Metadata Dialog
     activeMetadataDialog?.let { metaText ->
         AlertDialog(
             onDismissRequest = { activeMetadataDialog = null },
@@ -468,7 +756,6 @@ fun DubberLiveApp() {
             .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // App Top Bar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -497,6 +784,12 @@ fun DubberLiveApp() {
                         fontWeight = FontWeight.Medium,
                         color = TextMuted
                     )
+                    Text(
+                        " • ID: $deviceId",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = PrimaryIndigo
+                    )
                     if (DubberQueueManager.queueSize > 0) {
                         Text(
                             " • Queue: ${DubberQueueManager.queueSize}",
@@ -517,7 +810,6 @@ fun DubberLiveApp() {
             }
         }
 
-        // Settings Expandable Card
         AnimatedVisibility(visible = showSettings) {
             Card(
                 modifier = Modifier
@@ -574,7 +866,6 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Title Input Box with Cross "✕" Button & Updated Placeholder
         OutlinedTextField(
             value = customTitle,
             onValueChange = {
@@ -635,7 +926,6 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Language Filter Chips
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -673,7 +963,6 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Main Action Button
         Button(
             onClick = {
                 if (videoUrl.isNotBlank()) {
@@ -696,7 +985,6 @@ fun DubberLiveApp() {
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Live Facebook Upload Card
         if (isUploadingToFb) {
             Card(
                 modifier = Modifier
@@ -724,7 +1012,6 @@ fun DubberLiveApp() {
             }
         }
 
-        // Live Engine Status Card + Connectivity Error Box
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -780,7 +1067,6 @@ fun DubberLiveApp() {
                     )
                 }
 
-                // Cloud Connectivity Error Retry Action
                 if (DubberQueueManager.canReconnect && DubberQueueManager.activeRunId != null) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Button(
@@ -802,7 +1088,6 @@ fun DubberLiveApp() {
             }
         }
 
-        // History Video Cards
         if (DubberQueueManager.historyList.isNotEmpty()) {
             Spacer(modifier = Modifier.height(16.dp))
             Row(
@@ -837,7 +1122,6 @@ fun DubberLiveApp() {
                         colors = CardDefaults.cardColors(containerColor = CardBackground)
                     ) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            // Video Title Header
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -883,7 +1167,6 @@ fun DubberLiveApp() {
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            // Page Selector Dropdown
                             var dropdownExpanded by remember { mutableStateOf(false) }
                             Box(modifier = Modifier.fillMaxWidth()) {
                                 OutlinedButton(
@@ -917,7 +1200,6 @@ fun DubberLiveApp() {
 
                             Spacer(modifier = Modifier.height(8.dp))
 
-                            // Schedule Input Row
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -942,7 +1224,6 @@ fun DubberLiveApp() {
 
                             Spacer(modifier = Modifier.height(10.dp))
 
-                            // Action Buttons Row
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -1030,7 +1311,6 @@ fun DubberLiveApp() {
                                                         history.isUploaded = true
                                                         DubberQueueManager.saveHistory(context)
 
-                                                        // Auto clear title upon successful upload
                                                         customTitle = ""
                                                         prefs.edit().putString("custom_title", "").apply()
 
@@ -1083,6 +1363,7 @@ suspend fun executeCloudDubbingPipeline(
     videoUrl: String,
     targetLang: String,
     speed: Float,
+    deviceId: String,
     onStatusUpdate: (String, String, String) -> Unit,
     onComplete: (String, String) -> Unit,
     onError: (String) -> Unit
@@ -1101,6 +1382,7 @@ suspend fun executeCloudDubbingPipeline(
                 put("video_url", videoUrl)
                 put("target_language", targetLang)
                 put("video_speed", speed.toString())
+                put("device_id", deviceId)
             })
         }
 
@@ -1122,15 +1404,22 @@ suspend fun executeCloudDubbingPipeline(
 
         var runId: Long? = null
         for (i in 1..12) {
-            val runsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs?event=workflow_dispatch&per_page=1"
+            val runsUrl = "https://api.github.com/repos/$owner/$repo/actions/runs?event=workflow_dispatch&per_page=10"
             val runsReq = Request.Builder().url(runsUrl).addHeader("Authorization", authHeader).build()
             val runsRes = client.newCall(runsReq).execute()
             if (runsRes.isSuccessful) {
                 val json = JSONObject(runsRes.body?.string() ?: "")
                 val runsArray = json.optJSONArray("workflow_runs")
-                if (runsArray != null && runsArray.length() > 0) {
-                    runId = runsArray.getJSONObject(0).getLong("id")
-                    break
+                if (runsArray != null) {
+                    for (k in 0 until runsArray.length()) {
+                        val r = runsArray.getJSONObject(k)
+                        val name = r.optString("name", "")
+                        if (name.contains("[$deviceId]")) {
+                            runId = r.getLong("id")
+                            break
+                        }
+                    }
+                    if (runId != null) break
                 }
             }
             delay(3000)
@@ -1141,12 +1430,10 @@ suspend fun executeCloudDubbingPipeline(
             return@withContext
         }
 
-        // Save active run ID to disk for reconnection
         DubberQueueManager.activeRunId = runId
         prefs.edit().putLong("last_active_run_id", runId).apply()
 
-        // Delegate to resilient monitoring loop
-        monitorCloudRun(context, owner, repo, token, runId, onStatusUpdate, onComplete, onError)
+        monitorCloudRun(context, owner, repo, token, runId, deviceId, onStatusUpdate, onComplete, onError)
 
     } catch (e: Exception) {
         withContext(Dispatchers.Main) {
@@ -1155,13 +1442,13 @@ suspend fun executeCloudDubbingPipeline(
     }
 }
 
-// Resilient polling monitor with automatic retry on network drops
 suspend fun monitorCloudRun(
     context: Context,
     owner: String,
     repo: String,
     token: String,
     runId: Long,
+    deviceId: String,
     onStatusUpdate: (String, String, String) -> Unit,
     onComplete: (String, String) -> Unit,
     onError: (String) -> Unit
@@ -1265,8 +1552,8 @@ suspend fun monitorCloudRun(
     onStatusUpdate("🔗 Fetching cloud assets...", "Assembling media package...", extractedPreview)
     delay(2000)
 
-    val releaseUrl = "https://api.github.com/repos/$owner/$repo/releases/latest"
-    val relReq = Request.Builder().url(releaseUrl).addHeader("Authorization", authHeader).build()
+    val releaseTagUrl = "https://api.github.com/repos/$owner/$repo/releases/tags/release-$deviceId-$runId"
+    val relReq = Request.Builder().url(releaseTagUrl).addHeader("Authorization", authHeader).build()
     val relRes = client.newCall(relReq).execute()
 
     var videoDownloadUrl = ""
@@ -1313,7 +1600,8 @@ suspend fun monitorCloudRun(
                 srtUrl = srtDownloadUrl,
                 timestamp = timeStr,
                 sourceMetaText = sourceMetadataJson,
-                isUploaded = false
+                isUploaded = false,
+                deviceId = deviceId
             )
         )
         onComplete(videoDownloadUrl, srtDownloadUrl)
@@ -1368,7 +1656,6 @@ suspend fun uploadUrlDirectlyToFacebook(
             return@withContext
         }
 
-        // Live Buffering / Download Tracking from Server
         val sourceReq = Request.Builder().url(videoUrl).build()
         val sourceRes = uploadClient.newCall(sourceReq).execute()
 
@@ -1402,7 +1689,6 @@ suspend fun uploadUrlDirectlyToFacebook(
             output.flush()
         }
 
-        // Live Upload Tracking to Facebook
         val countingBody = ProgressRequestBody(
             file = tempVideoFile,
             contentType = "application/octet-stream".toMediaType()
@@ -1422,7 +1708,6 @@ suspend fun uploadUrlDirectlyToFacebook(
 
         uploadClient.newCall(uploadReq).execute().close()
 
-        // Attach SRT Captions
         if (srtUrl.isNotBlank()) {
             try {
                 onProgress("Syncing subtitles...", 95)
@@ -1453,7 +1738,6 @@ suspend fun uploadUrlDirectlyToFacebook(
             } catch (_: Exception) {}
         }
 
-        // Finalize Publish or Schedule on Facebook
         onProgress(if (scheduledPublishTime != null) "Scheduling Reel on Meta..." else "Publishing Reel...", 99)
         val publishUrl = "https://graph.facebook.com/v20.0/$pageId/video_reels"
         val pubPayload = JSONObject().apply {
