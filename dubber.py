@@ -89,7 +89,7 @@ def get_system_font():
 
 # ================= DOWNLOAD =================
 
-def download_media(url):
+def download_media(url, device_id="default"):
     video_path = "raw_source.mp4"
     audio_path = "input_audio.wav"
 
@@ -108,13 +108,14 @@ def download_media(url):
         "no_warnings": True
     }
 
-    print("📥 Downloading media...")
+    print(f"📥 Downloading media for client device [{device_id}]...")
     with yt_dlp.YoutubeDL(opts) as ydl:
         meta = ydl.extract_info(url, download=True)
         metadata = {
             "title": meta.get("title", "Dubbed Video"),
             "description": meta.get("description", ""),
-            "tags": meta.get("tags", [])
+            "tags": meta.get("tags", []),
+            "device_id": device_id
         }
 
     with open("source_meta.json", "w", encoding="utf-8") as f:
@@ -141,7 +142,6 @@ def contains_devanagari(text):
     return bool(re.search(r"[\u0900-\u097F]", text))
 
 def translate_gtx(text, target_lang="hi"):
-    """Direct API query to prevent scraper blocks and rate-limiting."""
     try:
         encoded = urllib.parse.quote(text)
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={encoded}"
@@ -158,12 +158,10 @@ def translate_text(text, target_lang):
     if not text or len(text) < 2:
         return text
 
-    # Strategy 1: High-quota direct endpoint
     res = translate_gtx(text, target_lang)
     if res and (target_lang != "hi" or contains_devanagari(res)):
         return res
 
-    # Strategy 2: GoogleTranslator
     for _ in range(2):
         try:
             res = GoogleTranslator(source="auto", target=target_lang).translate(text)
@@ -172,7 +170,6 @@ def translate_text(text, target_lang):
         except Exception:
             time.sleep(0.2)
 
-    # Strategy 3: MyMemory Fallback
     try:
         tgt = "hi-IN" if target_lang == "hi" else target_lang
         res = MyMemoryTranslator(source="auto", target=tgt).translate(text)
@@ -453,7 +450,6 @@ def mux_final_video(extended_video, dubbed_audio, output_file):
     font_path = get_system_font()
     font_arg = f"fontfile='{font_path}':" if font_path else ""
 
-    # Animated Lissajous trajectory for transparent "Movies Jet" watermark
     watermark_filter = (
         f"drawtext={font_arg}text='Movies Jet':fontsize=h/42:"
         f"fontcolor=white@0.30:bordercolor=black@0.18:borderw=1:"
@@ -555,15 +551,16 @@ def cleanup():
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print('Usage: python dub.py "VIDEO_URL" [target_language]')
+        print('Usage: python dubber.py "VIDEO_URL" [target_language] [device_id]')
         sys.exit(1)
 
     video_url = sys.argv[1]
     target_language = (sys.argv[2] if len(sys.argv) > 2 else "hi").lower()
+    client_device_id = sys.argv[3] if len(sys.argv) > 3 else "default"
 
     print()
     print("=" * 55)
-    print("AI DUBBING ENGINE (WATERMARKED & ROBUST)")
+    print(f"AI DUBBING ENGINE [Client: {client_device_id}]")
     print("=" * 55)
     print(f"Target language : {target_language}")
     print(f"TTS Speech rate : {TTS_RATE}")
@@ -575,7 +572,7 @@ if __name__ == "__main__":
     t_start = time.time()
 
     try:
-        video_file, audio_file, metadata = download_media(video_url)
+        video_file, audio_file, metadata = download_media(video_url, device_id=client_device_id)
 
         segments = transcribe_and_translate(audio_file, target_language)
         if not segments:
