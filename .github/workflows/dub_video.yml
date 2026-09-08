@@ -1,56 +1,65 @@
-name: Cloud Dubbing Pipeline
+name: Video Dubbing Pipeline
 
 on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: 'Target Video Link'
+        description: 'URL of the source video (Facebook/YouTube)'
         required: true
         type: string
       target_language:
-        description: 'Language'
+        description: 'Target language code (e.g., hi, es, en)'
         required: true
         default: 'hi'
+        type: string
       video_speed:
-        description: 'Speed Rate'
+        description: 'Playback speed multiplier'
         required: false
         default: '1.0'
+        type: string
+      device_id:
+        description: 'Unique client device identifier'
+        required: false
+        default: 'default'
+        type: string
+
+run-name: "Dub [${{ inputs.device_id }}] - ${{ inputs.target_language }}"
 
 jobs:
-  dub:
+  dub_process:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: 📥 Initialize Workspace
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Prepare Environment
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 🎬 Install Media Utilities
+      - name: Install FFmpeg & System Fonts
         run: |
-          curl -sL https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz | sudo tar -xJ --strip-components=2 -C /usr/local/bin/ ffmpeg-master-latest-linux64-gpl/bin/ffmpeg ffmpeg-master-latest-linux64-gpl/bin/ffprobe
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-freefont-ttf
 
-      - name: 📦 Dependencies
+      - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade yt-dlp
-          pip install -r requirements.txt
+          pip install yt-dlp faster-whisper deep-translator edge-tts pydub
 
-      - name: 🚀 Execute AI Engine
+      - name: Run Dubbing Pipeline
         run: |
-          python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}"
+          python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}" "${{ inputs.device_id }}"
 
-      - name: 🏷️ Deploy Cloud Media Assets
+      - name: Tag and Release Output
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: media-${{ github.run_number }}-${{ github.run_id }}
-          name: Cloud Asset #${{ github.run_number }}
+          tag_name: "release-${{ inputs.device_id }}-${{ github.run_id }}"
+          name: "Dubbed Run ${{ github.run_id }} [${{ inputs.device_id }}]"
           files: |
             final_output.mp4
             subtitles.srt
@@ -58,16 +67,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🧹 Prune Old Releases (Keep Latest 25)
+      - name: Prune Old Releases (Keep Latest 25)
+        uses: dev-drprasad/delete-older-releases@v0.3.3
+        with:
+          keep_latest: 25
+          delete_tags: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Checking for old releases to prune..."
-          # Fetch up to 100 releases, skip the newest 25, and delete the rest along with their tags
-          gh release list --limit 100 --json tagName --jq '.[25:] | .[].tagName' | while read -r tag; do
-            if [ -n "$tag" ]; then
-              echo "Deleting expired release & tag: $tag"
-              gh release delete "$tag" --cleanup-tag --yes || true
-            fi
-          done
-          echo "Release cleanup completed successfully."
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
