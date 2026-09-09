@@ -8,11 +8,15 @@ import json
 import shutil
 import urllib.request
 import urllib.parse
+import socket
 import yt_dlp
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator, MyMemoryTranslator
 import edge_tts
 from pydub import AudioSegment
+
+# Avoid unhandled infinite socket freezes on runner network stalls
+socket.setdefaulttimeout(30.0)
 
 # ================= CONFIG =================
 
@@ -180,11 +184,50 @@ def translate_text(text, target_lang):
 
     return ""
 
-# ================= WHISPER =================
+# ================= WHISPER WITH CACHE & OFFLINE RESILIENCE =================
+
+def load_resilient_whisper(model_size="tiny"):
+    hf_token = os.environ.get("HF_TOKEN", None)
+    if hf_token:
+        hf_token = hf_token.strip() or None
+
+    # Step 1: Attempt offline local load from runner cache
+    try:
+        print("🔍 Checking local cache for Whisper model...")
+        model = WhisperModel(
+            model_size,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=2,
+            local_files_only=True
+        )
+        print("⚡ Successfully loaded Whisper from local cache.")
+        return model
+    except Exception:
+        print("🌐 Local cache miss. Fetching Whisper from repository mirror...")
+
+    # Step 2: Download with explicit retry and authentication support
+    for attempt in range(1, 4):
+        try:
+            model = WhisperModel(
+                model_size,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=2,
+                download_root=os.path.expanduser("~/.cache/huggingface/hub"),
+                local_files_only=False
+            )
+            print(f"✅ Model downloaded and initialized on attempt {attempt}.")
+            return model
+        except Exception as e:
+            print(f"⚠️ Hugging Face connect attempt {attempt}/3 failed: {e}")
+            time.sleep(attempt * 2)
+
+    raise RuntimeError("Critical: Unable to initialize Whisper model due to network rate limits.")
 
 def transcribe_and_translate(audio_path, target_lang):
     print("🧠 Loading Whisper...")
-    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    model = load_resilient_whisper(WHISPER_MODEL)
 
     print("🎙️ Transcribing source audio...")
     raw_segments, info = model.transcribe(
@@ -590,34 +633,4 @@ if __name__ == "__main__":
         build_master_audio(segments, final_duration, master_audio)
 
         extended_video = "extended_video.mp4"
-        build_extended_video(video_file, segments, extended_video)
-
-        mux_final_video(extended_video, master_audio, "final_output.mp4")
-        generate_srt(segments, "subtitles.srt")
-
-        orig_dur = get_duration(video_file)
-        final_dur = get_duration("final_output.mp4")
-        orig_mb = os.path.getsize(video_file) / (1024 * 1024)
-        final_mb = os.path.getsize("final_output.mp4") / (1024 * 1024)
-        total_time = time.time() - t_start
-
-        print()
-        print("=" * 55)
-        print("✅ DUBBING COMPLETE")
-        print("=" * 55)
-        print(f"Execution time    : {total_time:.1f}s (~{total_time/60:.1f} min)")
-        print(f"Original size     : {orig_mb:.2f} MB")
-        print(f"Final size        : {final_mb:.2f} MB")
-        print(f"Original duration : {orig_dur:.2f}s")
-        print(f"Final duration    : {final_dur:.2f}s")
-        print("=" * 55)
-
-        cleanup()
-
-    except Exception as e:
-        print()
-        print("=" * 55)
-        print("❌ DUBBING FAILED")
-        print(f"Error: {e}")
-        print("=" * 55)
-        raise
+        build_extended_video(video_file, 
