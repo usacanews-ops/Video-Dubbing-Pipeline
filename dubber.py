@@ -191,7 +191,6 @@ def load_resilient_whisper(model_size="tiny"):
     if hf_token:
         hf_token = hf_token.strip() or None
 
-    # Step 1: Attempt offline local load from runner cache
     try:
         print("🔍 Checking local cache for Whisper model...")
         model = WhisperModel(
@@ -206,7 +205,6 @@ def load_resilient_whisper(model_size="tiny"):
     except Exception:
         print("🌐 Local cache miss. Fetching Whisper from repository mirror...")
 
-    # Step 2: Download with explicit retry and authentication support
     for attempt in range(1, 4):
         try:
             model = WhisperModel(
@@ -633,4 +631,34 @@ if __name__ == "__main__":
         build_master_audio(segments, final_duration, master_audio)
 
         extended_video = "extended_video.mp4"
-        build_extended_video(video_file, 
+        build_extended_video(video_file, segments, extended_video)
+
+        mux_final_video(extended_video, master_audio, "final_output.mp4")
+        generate_srt(segments, "subtitles.srt")
+
+        orig_dur = get_duration(video_file)
+        final_dur = get_duration("final_output.mp4")
+        orig_mb = os.path.getsize(video_file) / (1024 * 1024)
+        final_mb = os.path.getsize("final_output.mp4") / (1024 * 1024)
+        total_time = time.time() - t_start
+
+        print()
+        print("=" * 55)
+        print("✅ DUBBING COMPLETE")
+        print("=" * 55)
+        print(f"Execution time    : {total_time:.1f}s (~{total_time/60:.1f} min)")
+        print(f"Original size     : {orig_mb:.2f} MB")
+        print(f"Final size        : {final_mb:.2f} MB")
+        print(f"Original duration : {orig_dur:.2f}s")
+        print(f"Final duration    : {final_dur:.2f}s")
+        print("=" * 55)
+
+        cleanup()
+
+    except Exception as e:
+        print()
+        print("=" * 55)
+        print("❌ DUBBING FAILED")
+        print(f"Error: {e}")
+        print("=" * 55)
+        raise
