@@ -43,8 +43,11 @@ jobs:
 
       - name: Install FFmpeg & System Fonts
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-freefont-ttf
+          # Remove broken third-party Google Chrome repository list from runner image
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get clean
+          sudo apt-get update -o Acquire::CompressionTypes::Order::=gz
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-freefont-ttf
 
       - name: Install Python Dependencies
         run: |
@@ -74,3 +77,4 @@ jobs:
           delete_tags: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
