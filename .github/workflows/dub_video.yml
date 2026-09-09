@@ -43,7 +43,6 @@ jobs:
 
       - name: Install FFmpeg & System Fonts
         run: |
-          # Purge all Google/Chrome repository configurations (both .list and .sources deb822 formats)
           sudo rm -f /etc/apt/sources.list.d/*chrome*
           sudo rm -f /etc/apt/sources.list.d/*google*
           sudo rm -rf /var/lib/apt/lists/*
@@ -51,12 +50,25 @@ jobs:
           sudo apt-get update -o Acquire::Retries=3 || true
           sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-freefont-ttf
 
+      - name: Cache Hugging Face & Whisper Models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-whisper-tiny-v2
+          restore-keys: |
+            ${{ runner.os }}-whisper-tiny-
+
       - name: Install Python Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install yt-dlp faster-whisper deep-translator edge-tts pydub
 
       - name: Run Dubbing Pipeline
+        env:
+          PYTHONUNBUFFERED: "1"
+          HF_HUB_DISABLE_TELEMETRY: "1"
+          HF_HUB_ENABLE_HF_TRANSFER: "0"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python dubber.py "${{ inputs.video_url }}" "${{ inputs.target_language }}" "${{ inputs.device_id }}"
 
